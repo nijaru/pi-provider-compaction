@@ -68,7 +68,6 @@ test("shapes the standalone compact request and preserves opaque output", async 
 		headers: { Authorization: null, "x-test": "yes" },
 		input: [{ type: "message", role: "user", content: "hello" }],
 		instructions: "system",
-		tools: [{ type: "function", name: "read" }],
 		fetchImpl,
 	});
 
@@ -83,7 +82,6 @@ test("shapes the standalone compact request and preserves opaque output", async 
 		model: model.id,
 		input: [{ type: "message", role: "user", content: "hello" }],
 		instructions: "system",
-		tools: [{ type: "function", name: "read" }],
 	});
 	expect(result.output).toEqual([compactionItem, { type: "message", id: "kept" }]);
 });
@@ -124,7 +122,28 @@ test("replaces old context and retains items after the native window", () => {
 		...payload,
 		input: [nativeMessage, compactionItem, { type: "message", role: "user", content: "new" }],
 	});
-	 expect(rewritten).not.toBe(payload);
+	expect(rewritten).not.toBe(payload);
+});
+
+test("does not anchor on an older duplicate post-compaction message", () => {
+	const nativeMessage = { type: "message", id: "kept", role: "assistant" } as Record<string, unknown>;
+	const repeatedUser = { type: "message", role: "user", content: "same" } as Record<string, unknown>;
+	const intervening = {
+		type: "message",
+		role: "assistant",
+		content: [{ type: "output_text", text: "between" }],
+	} as Record<string, unknown>;
+	const nativeDetails = details([nativeMessage, compactionItem]);
+	const payload = {
+		model: model.id,
+		input: [nativeMessage, repeatedUser, intervening, repeatedUser],
+	};
+
+	const rewritten = rewriteResponsesPayload(payload, nativeDetails, [repeatedUser, intervening, repeatedUser]);
+	expect(rewritten).toEqual({
+		...payload,
+		input: [nativeMessage, compactionItem, repeatedUser, intervening, repeatedUser],
+	});
 });
 
 test("leaves unsupported providers on Pi's normal path", async () => {
@@ -143,6 +162,8 @@ test("leaves unsupported providers on Pi's normal path", async () => {
 	const unsupported = { ...model, api: "anthropic-messages" } as Model<any>;
 	expect(await handler?.({ preparation: {}, branchEntries: [], signal: new AbortController().signal }, { model: unsupported })).toBeUndefined();
 	expect(supportsNativeCompaction(unsupported)).toBe(false);
+	expect(supportsNativeCompaction({ ...model, provider: "openai-codex", api: "openai-codex-responses" })).toBe(false);
+	expect(supportsNativeCompaction({ ...model, provider: "xai" })).toBe(false);
 });
 
 test("does not override an explicitly selected generic compaction model", async () => {

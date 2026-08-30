@@ -1,8 +1,5 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import {
-	convertResponsesMessages,
-	convertResponsesTools,
-} from "@earendil-works/pi-ai/api/openai-responses-shared";
+import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import type { Model } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
@@ -18,7 +15,6 @@ export const NATIVE_COMPACTION_VERSION = 1;
 export const NATIVE_COMPACTION_SUMMARY =
 	"This context was compacted using the provider's native OpenAI Responses state.";
 
-const SUPPORTED_APIS = new Set(["openai-responses", "openai-codex-responses"]);
 const TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
 
 type ResponseItem = Record<string, unknown>;
@@ -43,7 +39,7 @@ function isObject(value: unknown): value is JsonObject {
 }
 
 export function supportsNativeCompaction(model: Model<any> | undefined): model is Model<any> {
-	return model !== undefined && SUPPORTED_APIS.has(model.api);
+	return model?.provider === "openai" && model.api === "openai-responses";
 }
 
 function isCompactionItem(value: unknown): value is ResponseItem {
@@ -141,7 +137,6 @@ export interface CompactRequestOptions {
 	headers?: Record<string, string | null>;
 	input: ResponseItem[];
 	instructions?: string;
-	tools?: ResponseItem[];
 	signal?: AbortSignal;
 	fetchImpl?: FetchImplementation;
 }
@@ -153,7 +148,6 @@ export async function compactOpenAIResponses(options: CompactRequestOptions): Pr
 		input: options.input,
 	};
 	if (options.instructions) body.instructions = options.instructions;
-	if (options.tools && options.tools.length > 0) body.tools = options.tools;
 
 	const response = await (options.fetchImpl ?? fetch)(endpoint, {
 		method: "POST",
@@ -194,16 +188,9 @@ function itemMatches(left: ResponseItem, right: ResponseItem): boolean {
 	return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function findLastMatchingItem(items: ResponseItem[], target: ResponseItem): number {
-	for (let index = items.length - 1; index >= 0; index--) {
-		if (itemMatches(items[index], target)) return index;
-	}
-	return -1;
-}
-
-function findSubsequence(items: ResponseItem[], sequence: ResponseItem[]): number {
+function findLastSubsequence(items: ResponseItem[], sequence: ResponseItem[]): number {
 	if (sequence.length === 0) return -1;
-	for (let start = 0; start <= items.length - sequence.length; start++) {
+	for (let start = items.length - sequence.length; start >= 0; start--) {
 		let matches = true;
 		for (let offset = 0; offset < sequence.length; offset++) {
 			if (!itemMatches(items[start + offset], sequence[offset])) {
@@ -226,36 +213,22 @@ export function rewriteResponsesPayload(
 	const currentInput = payload.input.filter((item): item is ResponseItem => isObject(item));
 	if (currentInput.length !== payload.input.length) return payload;
 
-	for (let index = details.output.length - 1; index >= 0; index--) {
-		const nativeItem = details.output[index];
-		if (nativeItem.type === "compaction") continue;
-		const anchor = findLastMatchingItem(currentInput, nativeItem);
-		if (anchor >= 0) {
-			return { ...payload, input: [...details.output, ...currentInput.slice(anchor + 1)] };
-		}
-	}
-
-	const postStart = findSubsequence(currentInput, postCompactionItems);
+	// Prefer the post-compaction boundary. Matching an individual retained item
+	// first can select an older duplicate user message and drop intervening state.
+	const postStart = findLastSubsequence(currentInput, postCompactionItems);
 	if (postStart >= 0) {
 		return { ...payload, input: [...details.output, ...currentInput.slice(postStart)] };
 	}
-	return { ...payload, input: [...details.output, ...postCompactionItems] };
-}
 
-function configuredTools(pi: ExtensionAPI, model: Model<any>): ResponseItem[] {
-	const active = new Set(pi.getActiveTools());
-	const tools = pi
-		.getAllTools()
-		.filter((tool) => active.has(tool.name))
-		.map((tool) => ({ name: tool.name, description: tool.description, parameters: tool.parameters }));
-	const compat = model.compat as {
-		supportsStrictMode?: boolean;
-		supportsOpenAIGrammarTools?: boolean;
-	} | undefined;
-	return convertResponsesTools(tools, {
-		supportsStrictMode: compat?.supportsStrictMode ?? false,
-		supportsOpenAIGrammarTools: compat?.supportsOpenAIGrammarTools ?? false,
-	}) as unknown as ResponseItem[];
+	const retainedOutput = details.output.filter((item) => item.type !== "compaction");
+	const retainedStart = findLastSubsequence(currentInput, retainedOutput);
+	if (retainedStart >= 0) {
+		return {
+			...payload,
+			input: [...details.output, ...currentInput.slice(retainedStart + retainedOutput.length)],
+		};
+	}
+	return { ...payload, input: [...details.output, ...postCompactionItems] };
 }
 
 function hasGenericCompactionModel(pi: ExtensionAPI): boolean {
@@ -264,13 +237,8 @@ function hasGenericCompactionModel(pi: ExtensionAPI): boolean {
 }
 
 export default function (pi: ExtensionAPI): void {
-	let lastRequestTools: ResponseItem[] | undefined;
-
 	pi.on("before_provider_request", (event, ctx) => {
 		const model = ctx.model;
-		if (isObject(event.payload) && Array.isArray(event.payload.tools)) {
-			lastRequestTools = event.payload.tools.filter(isObject) as ResponseItem[];
-		}
 		if (hasGenericCompactionModel(pi) || !supportsNativeCompaction(model)) return;
 
 		const latest = findLatestNativeCompaction(ctx.sessionManager.getBranch(), model);
@@ -309,7 +277,6 @@ export default function (pi: ExtensionAPI): void {
 				headers: auth.headers,
 				input,
 				instructions: instructions || undefined,
-				tools: lastRequestTools ?? configuredTools(pi, model),
 				signal: event.signal,
 			});
 			return {

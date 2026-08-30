@@ -23,10 +23,10 @@ also want its model-driven `compact` tool and context-usage hints.
 
 ## OpenAI Responses
 
-The initial adapter supports models using Pi's `openai-responses` or
-`openai-codex-responses` APIs. During Pi compaction it calls the provider's
-stateless `/responses/compact` endpoint, persists the returned opaque compaction
-item in the session, and replays the canonical compacted window on later requests.
+The initial adapter supports the official OpenAI provider's `openai-responses`
+API. During Pi compaction it calls the provider's stateless `/responses/compact`
+endpoint, persists the returned opaque compaction item in the session, and
+replays the canonical compacted window on later requests.
 
 The adapter leaves unsupported APIs on Pi's normal compaction path. If
 `--compaction-model` is set, the explicit generic compaction model takes
