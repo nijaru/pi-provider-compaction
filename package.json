@@ -1,0 +1,45 @@
+{
+  "name": "pi-provider-compaction",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Provider-native context compaction adapters for Pi",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "compaction",
+    "openai",
+    "responses"
+  ],
+  "license": "MIT",
+  "author": "Nick Naru <nick@nijaru.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/nijaru/pi-provider-compaction.git"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "check": "bun test && bun run typecheck"
+  },
+  "files": [
+    "index.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@types/bun": "latest",
+    "typescript": "^6.0.3"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
