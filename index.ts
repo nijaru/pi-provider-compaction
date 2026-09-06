@@ -1,14 +1,17 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
-import type { Model } from "@earendil-works/pi-ai";
+import { calculateCost } from "@earendil-works/pi-ai";
+import type { Model, Usage } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
+	ExtensionContext,
 	SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import {
 	convertToLlm,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
+import { COMPACTION_MODEL_FLAG, resolveCompactionModelPolicy } from "./policy";
 
 export const NATIVE_COMPACTION_TYPE = "pi-provider-compaction/openai-responses";
 export const NATIVE_COMPACTION_VERSION = 1;
@@ -28,6 +31,8 @@ export interface NativeCompactionDetails {
 	api: string;
 	model: string;
 	output: ResponseItem[];
+	/** Provider token accounting for the compaction pass, when reported. */
+	usage?: Usage;
 }
 
 interface NativeCompactionState extends NativeCompactionDetails {
@@ -155,7 +160,11 @@ export async function compactOpenAIResponses(options: CompactRequestOptions): Pr
 		body: JSON.stringify(body),
 		signal: options.signal,
 	});
-	if (!response.ok) throw new Error(`OpenAI Responses compact request failed (${response.status})`);
+	if (!response.ok) {
+		const detail = await response.text().catch(() => "");
+		const suffix = detail ? `: ${detail.slice(0, 400)}` : "";
+		throw new Error(`OpenAI Responses compact request failed (${response.status}${suffix})`);
+	}
 
 	const result: unknown = await response.json();
 	if (!isObject(result) || !Array.isArray(result.output)) {
@@ -172,7 +181,40 @@ export async function compactOpenAIResponses(options: CompactRequestOptions): Pr
 		api: options.model.api,
 		model: options.model.id,
 		output,
+		usage: compactUsage(options.model, result),
 	};
+}
+
+/** Map the compact response's ResponseUsage onto Pi's Usage, with cost applied. */
+function compactUsage(model: Model<any>, result: JsonObject): Usage | undefined {
+	const usage = result.usage;
+	if (!isObject(usage)) return undefined;
+	const cached = nestedNumber(usage.input_tokens_details, "cached_tokens");
+	const cacheWrite = nestedNumber(usage.input_tokens_details, "cache_write_tokens");
+	const mapped: Usage = {
+		// OpenAI includes cached and cache-write tokens in input_tokens, so subtract both.
+		input: Math.max(0, readNumber(usage.input_tokens) - cached - cacheWrite),
+		output: readNumber(usage.output_tokens),
+		cacheRead: cached,
+		cacheWrite,
+		reasoning: nestedNumber(usage.output_tokens_details, "reasoning_tokens"),
+		totalTokens: readNumber(usage.total_tokens),
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+	};
+	try {
+		calculateCost(model, mapped);
+	} catch {
+		// Cost lookup can fail for models without cost metadata; the token counts remain useful.
+	}
+	return mapped;
+}
+
+function readNumber(value: unknown): number {
+	return typeof value === "number" && Number.isFinite(value) ? value : 0;
+}
+
+function nestedNumber(value: unknown, key: string): number {
+	return isObject(value) ? readNumber(value[key]) : 0;
 }
 
 function itemMatches(left: ResponseItem, right: ResponseItem): boolean {
@@ -231,19 +273,31 @@ export function rewriteResponsesPayload(
 	return { ...payload, input: [...details.output, ...postCompactionItems] };
 }
 
-function hasGenericCompactionModel(pi: ExtensionAPI): boolean {
-	const value = pi.getFlag("compaction-model");
-	return typeof value === "string" && value.trim() !== "";
+/** True when pi-compactor's generic compaction model takes precedence (flag or policy file). */
+function genericCompactionSelected(
+	pi: Pick<ExtensionAPI, "getFlag">,
+	ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted" | "sessionManager">,
+): boolean {
+	return resolveCompactionModelPolicy(pi, ctx).hasSelectors;
 }
 
 export default function (pi: ExtensionAPI): void {
+	// Pi scopes getFlag to flags the calling extension registered. Registering
+	// pi-compactor's flag name here lets this extension observe the shared CLI
+	// value, and keeps precedence working when pi-compactor is not installed.
+	pi.registerFlag(COMPACTION_MODEL_FLAG, {
+		description: "Generic compaction model taking precedence over provider-native compaction (provider/model-id)",
+		type: "string",
+	});
+
 	pi.on("before_provider_request", (event, ctx) => {
 		const model = ctx.model;
-		if (hasGenericCompactionModel(pi) || !supportsNativeCompaction(model)) return;
-
-		const latest = findLatestNativeCompaction(ctx.sessionManager.getBranch(), model);
-		if (!latest) return;
+		if (!supportsNativeCompaction(model)) return;
 		const branch = ctx.sessionManager.getBranch();
+		const latest = findLatestNativeCompaction(branch, model);
+		// Resolve the policy only when a native window exists to replay: the disk
+		// reads are wasted work on every ordinary request otherwise.
+		if (!latest || genericCompactionSelected(pi, ctx)) return;
 		const index = branch.findIndex((entry) => entry.id === latest.entryId);
 		const postItems = index >= 0 ? responseItemsFromEntries(model, branch.slice(index + 1)) : [];
 		const rewritten = rewriteResponsesPayload(event.payload, latest, postItems);
@@ -255,7 +309,8 @@ export default function (pi: ExtensionAPI): void {
 
 	pi.on("session_before_compact", async (event, ctx) => {
 		const model = ctx.model;
-		if (hasGenericCompactionModel(pi) || !supportsNativeCompaction(model)) return;
+		if (!supportsNativeCompaction(model)) return;
+		if (genericCompactionSelected(pi, ctx)) return;
 
 		try {
 			const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
@@ -284,6 +339,7 @@ export default function (pi: ExtensionAPI): void {
 					summary: NATIVE_COMPACTION_SUMMARY,
 					firstKeptEntryId: event.preparation.firstKeptEntryId,
 					tokensBefore: event.preparation.tokensBefore,
+					usage: details.usage,
 					details,
 				},
 			};

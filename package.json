@@ -24,19 +24,22 @@
   },
   "scripts": {
     "test": "bun test",
+    "lint": "oxlint index.ts policy.ts tests/",
     "typecheck": "tsc --noEmit",
-    "check": "bun test && bun run typecheck"
+    "check": "bun test && oxlint index.ts policy.ts tests/ && tsc --noEmit"
   },
   "files": [
     "index.ts",
+    "policy.ts",
     "README.md",
     "LICENSE"
   ],
   "devDependencies": {
-    "@earendil-works/pi-agent-core": "0.84.3",
-    "@earendil-works/pi-ai": "0.84.3",
-    "@earendil-works/pi-coding-agent": "0.84.3",
+    "@earendil-works/pi-agent-core": "0.85.1",
+    "@earendil-works/pi-ai": "0.85.1",
+    "@earendil-works/pi-coding-agent": "0.85.1",
     "@types/bun": "latest",
+    "oxlint": "^1.81.0",
     "typescript": "^6.0.3"
   },
   "peerDependencies": {

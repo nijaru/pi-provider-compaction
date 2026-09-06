@@ -28,13 +28,37 @@ API. During Pi compaction it calls the provider's stateless `/responses/compact`
 endpoint, persists the returned opaque compaction item in the session, and
 replays the canonical compacted window on later requests.
 
-The adapter leaves unsupported APIs on Pi's normal compaction path. If
-`--compaction-model` is set, the explicit generic compaction model takes
-precedence. Leave that flag unset to use native compaction.
+The adapter leaves unsupported APIs on Pi's normal compaction path.
+
+### Generic compaction-model precedence
+
+[pi-compactor](https://github.com/nijaru/pi-compactor) can run a generic model of
+your choice for compaction summaries. When one is configured, it takes
+precedence over provider-native compaction — this extension makes no native
+compaction request and replays no previously persisted native window. The same
+resolution order as pi-compactor applies:
+
+1. the `--compaction-model` flag (registered by both extensions so the shared
+   value stays visible),
+2. a trusted project's `.pi/compaction-policy.json` (`models` list), then
+3. the agent directory's `compaction-policy.json`.
+
+A policy file with an empty `models` list is an explicit choice to use no generic
+model, so native compaction runs. Leave the flag unset and no policy file present
+to use native compaction.
+
+### Session and cost behavior
 
 The provider's compacted output is opaque and is not shown as a human-readable
 summary. Pi's normal session entries remain available for transcript navigation;
 the native window is used only for subsequent provider requests.
+
+The compaction pass's token usage and cost are recorded on the compaction entry
+like any other compaction, so quota and cost extensions see them.
+
+Pi estimates post-compaction context size from the kept session entries. A native
+window is usually smaller than that estimate, so Pi's threshold may trigger the
+next compaction slightly earlier than strictly necessary.
 
 ## Related extensions
 
