@@ -11,7 +11,7 @@ import {
 	convertToLlm,
 	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
-import { COMPACTION_MODEL_FLAG, resolveCompactionModelPolicy } from "./policy";
+import { resolveCompactionModelPolicy } from "./policy";
 
 export const NATIVE_COMPACTION_TYPE = "pi-provider-compaction/openai-responses";
 export const NATIVE_COMPACTION_VERSION = 1;
@@ -282,13 +282,10 @@ function genericCompactionSelected(
 }
 
 export default function (pi: ExtensionAPI): void {
-	// Pi scopes getFlag to flags the calling extension registered. Registering
-	// pi-compactor's flag name here lets this extension observe the shared CLI
-	// value, and keeps precedence working when pi-compactor is not installed.
-	pi.registerFlag(COMPACTION_MODEL_FLAG, {
-		description: "Generic compaction model taking precedence over provider-native compaction (provider/model-id)",
-		type: "string",
-	});
+	// Do not register COMPACTION_MODEL_FLAG here: Pi rejects duplicate flag
+	// registrations, and pi-compactor already owns `--compaction-model`.
+	// Precedence reads the shared CLI value from process.argv (see policy.ts)
+	// so it works whether or not pi-compactor is installed.
 
 	pi.on("before_provider_request", (event, ctx) => {
 		const model = ctx.model;

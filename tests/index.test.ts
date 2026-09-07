@@ -14,7 +14,7 @@ import extension, {
 	rewriteResponsesPayload,
 	supportsNativeCompaction,
 } from "../index";
-import { resolveCompactionModelPolicy } from "../policy";
+import { readCompactionModelFlagFromArgv, resolveCompactionModelPolicy } from "../policy";
 
 const model = {
 	provider: "openai",
@@ -89,6 +89,7 @@ function createPi(flagValues: Record<string, string | boolean> = {}) {
 			},
 		} as unknown as ExtensionAPI,
 		handlers,
+		flags,
 	};
 }
 
@@ -114,11 +115,49 @@ function policyCtx(trusted = true) {
 // ── Policy precedence ───────────────────────────────────────────────────
 
 describe("generic-compaction-model precedence", () => {
-	test("flag takes precedence and registers for shared runtime visibility", () => {
-		const { pi, handlers } = createPi({ "compaction-model": "openrouter/deepseek/deepseek-v4-flash" });
+	test("does not register a duplicate flag owned by pi-compactor", () => {
+		const { pi, flags } = createPi();
+		extension(pi);
+		// Pi rejects two extensions registering the same flag; this extension
+		// must not register `compaction-model` at all.
+		expect([...flags].join(",")).not.toContain("compaction-model");
+	});
+
+	test("flag takes precedence via process.argv without registration", () => {
+		const { pi, handlers, flags } = createPi();
 		extension(pi);
 		expect(handlers.get("session_before_compact")).toBeDefined();
-		expect(resolveCompactionModelPolicy(pi, policyCtx())).toEqual({ hasSelectors: true, source: "flag" });
+		expect(flags.has("compaction-model")).toBe(false);
+		expect(
+			resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model", "openrouter/deepseek/deepseek-v4-flash"]),
+		).toEqual({ hasSelectors: true, source: "flag" });
+		expect(
+			resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model=openrouter/deepseek/deepseek-v4-flash"]),
+		).toEqual({ hasSelectors: true, source: "flag" });
+	});
+
+	test("argv flag parsing matches Pi semantics", () => {
+		expect(readCompactionModelFlagFromArgv(["--compaction-model", "openrouter/a"])).toBe("openrouter/a");
+		expect(readCompactionModelFlagFromArgv(["--compaction-model=openrouter/a"])).toBe("openrouter/a");
+		expect(readCompactionModelFlagFromArgv(["--compaction-model"])).toBe(true);
+		// Stops at `--`; last occurrence wins.
+		expect(readCompactionModelFlagFromArgv(["--compaction-model", "openrouter/a", "--", "--compaction-model", "openrouter/b"])).toBe(
+			"openrouter/a",
+		);
+		expect(readCompactionModelFlagFromArgv(["--compaction-model", "openrouter/a", "--compaction-model", "openrouter/b"])).toBe(
+			"openrouter/b",
+		);
+		// A bare flag falls through to policy files like Pi's "requires a value".
+		const { pi } = createPi();
+		writeAgentPolicy(["openrouter/deepseek/deepseek-v4-flash"]);
+		try {
+			expect(resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model"])).toEqual({
+				hasSelectors: true,
+				source: "agent-policy",
+			});
+		} finally {
+			writeAgentPolicy([]);
+		}
 	});
 
 	test("policy files with selectors take precedence when the flag is unset", () => {
@@ -126,13 +165,13 @@ describe("generic-compaction-model precedence", () => {
 		extension(pi);
 		try {
 			writeAgentPolicy(["openrouter/deepseek/deepseek-v4-flash"]);
-			expect(resolveCompactionModelPolicy(pi, policyCtx())).toEqual({ hasSelectors: true, source: "agent-policy" });
+			expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: true, source: "agent-policy" });
 
 			writeProjectPolicy(["openai/gpt-5.2"]);
-			expect(resolveCompactionModelPolicy(pi, policyCtx())).toEqual({ hasSelectors: true, source: "project-policy" });
+			expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: true, source: "project-policy" });
 
 			// An untrusted project policy must not be read.
-			expect(resolveCompactionModelPolicy(pi, policyCtx(false)).source).toBe("agent-policy");
+			expect(resolveCompactionModelPolicy(pi, policyCtx(false), []).source).toBe("agent-policy");
 		} finally {
 			rmSync(join(projectDir, ".pi", "compaction-policy.json"), { force: true });
 		}
@@ -142,20 +181,31 @@ describe("generic-compaction-model precedence", () => {
 		const { pi } = createPi();
 		extension(pi);
 		writeAgentPolicy([]);
-		expect(resolveCompactionModelPolicy(pi, policyCtx())).toEqual({ hasSelectors: false });
+		expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: false });
 	});
 
 	test("a malformed or oversized policy falls back to no selectors", () => {
 		const { pi } = createPi();
 		extension(pi);
 		writeFileSync(join(agentDir, "compaction-policy.json"), "{not json");
-		expect(resolveCompactionModelPolicy(pi, policyCtx())).toEqual({ hasSelectors: false });
+		expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: false });
 	});
 
 	test("a whitespace or oversized flag falls back like pi-compactor", () => {
-		const { pi } = createPi({ "compaction-model": "   " });
+		const { pi } = createPi();
 		extension(pi);
-		expect(resolveCompactionModelPolicy(pi, policyCtx()).hasSelectors).toBe(false);
+		// Whitespace falls through to policy files; with an explicit empty
+		// agent policy that means no generic model.
+		writeAgentPolicy([]);
+		try {
+			expect(resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model", "   "]).hasSelectors).toBe(false);
+			// Oversized selectors are rejected without falling through.
+			expect(resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model", `openrouter/${"a".repeat(600)}`])).toEqual({
+				hasSelectors: false,
+			});
+		} finally {
+			writeAgentPolicy([]);
+		}
 	});
 });
 

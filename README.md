@@ -38,8 +38,9 @@ precedence over provider-native compaction — this extension makes no native
 compaction request and replays no previously persisted native window. The same
 resolution order as pi-compactor applies:
 
-1. the `--compaction-model` flag (registered by both extensions so the shared
-   value stays visible),
+1. the `--compaction-model` flag (owned by pi-compactor; this extension reads
+   the shared CLI value from `process.argv` without re-registering it, since
+   Pi rejects duplicate flag registrations),
 2. a trusted project's `.pi/compaction-policy.json` (`models` list), then
 3. the agent directory's `compaction-policy.json`.
 

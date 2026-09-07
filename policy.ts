@@ -7,8 +7,10 @@
  * extension must not request a native compaction and must not replay a
  * previously persisted native window.
  *
- * Pi scopes `getFlag` to flags the calling extension registered, so this
- * extension registers the same flag name (see index.ts). The policy-file
+ * Pi scopes `getFlag` to flags the calling extension registered, and Pi
+ * rejects two extensions registering the same flag name. This extension
+ * therefore never registers `compaction-model` (owned by pi-compactor) and
+ * reads the shared CLI value from `process.argv` instead. The policy-file
  * fallback mirrors pi-compactor exactly: project policy requires project
  * trust; the agent-dir policy does not; a valid file with an empty `models`
  * list disables the generic model. This module must stay in sync with
@@ -130,12 +132,55 @@ function isProjectPolicyTrusted(ctx: PolicyContext, agentDir: string): boolean {
 	}
 }
 
+/**
+ * Read the shared `--compaction-model` CLI value without registering the flag.
+ * Mirrors Pi's unknown-flag parsing: `--compaction-model value` and
+ * `--compaction-model=value`; a bare flag yields `true`. Stops at `--`.
+ * Last occurrence wins, matching Pi's Map.set behavior.
+ */
+export function readCompactionModelFlagFromArgv(argv: readonly string[] = process.argv.slice(2)): string | boolean | undefined {
+	let value: string | boolean | undefined;
+	const prefix = `--${COMPACTION_MODEL_FLAG}=`;
+	for (let i = 0; i < argv.length; i++) {
+		const arg = argv[i];
+		if (arg === "--") break;
+		if (arg === `--${COMPACTION_MODEL_FLAG}`) {
+			const next = argv[i + 1];
+			if (next !== undefined && !next.startsWith("-") && !next.startsWith("@")) {
+				value = next;
+				i++;
+			} else {
+				value = true;
+			}
+		} else if (arg.startsWith(prefix)) {
+			value = arg.slice(prefix.length);
+		}
+	}
+	return value;
+}
+
 /** Resolve whether pi-compactor's generic compaction model takes precedence. */
-export function resolveCompactionModelPolicy(pi: Pick<ExtensionAPI, "getFlag">, ctx: PolicyContext): CompactionModelPolicy {
-	const rawFlag = pi.getFlag(COMPACTION_MODEL_FLAG);
-	if (typeof rawFlag === "string" && rawFlag.trim()) {
-		const selector = normalizeSelector(rawFlag);
+export function resolveCompactionModelPolicy(
+	pi: Pick<ExtensionAPI, "getFlag">,
+	ctx: PolicyContext,
+	argv: readonly string[] = process.argv.slice(2),
+): CompactionModelPolicy {
+	const argvRaw = readCompactionModelFlagFromArgv(argv);
+	if (typeof argvRaw === "string" && argvRaw.trim()) {
+		const selector = normalizeSelector(argvRaw);
 		return selector ? { hasSelectors: true, source: "flag" } : { hasSelectors: false };
+	}
+	// A bare `--compaction-model` (true) or whitespace value falls through like
+	// pi-compactor: Pi reports "requires a value" and the policy files still apply.
+	// An oversized selector above already returned hasSelectors:false.
+	try {
+		const rawFlag = pi.getFlag(COMPACTION_MODEL_FLAG);
+		if (typeof rawFlag === "string" && rawFlag.trim()) {
+			const selector = normalizeSelector(rawFlag);
+			return selector ? { hasSelectors: true, source: "flag" } : { hasSelectors: false };
+		}
+	} catch {
+		// getFlag can throw on a stale context; fall through to policy files.
 	}
 
 	const agentDir = activeAgentDir(ctx);
