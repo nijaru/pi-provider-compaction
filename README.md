@@ -60,6 +60,26 @@ Pi estimates post-compaction context size from the kept session entries. A nativ
 window is usually smaller than that estimate, so Pi's threshold may trigger the
 next compaction slightly earlier than strictly necessary.
 
+### Why not server-side compaction?
+
+OpenAI also offers server-side compaction (`context_management.compact_threshold` on
+the create request). This adapter deliberately uses the standalone endpoint
+instead, and re-evaluates when Pi can carry the server-side mode:
+
+- Both modes run the same compaction machinery and return the same opaque
+  encrypted item, so there is no summary-quality difference between them.
+- The server-side win is uninterrupted turns at the context limit (Pi currently
+  aborts, compacts, and retries). That requires Pi to persist an
+  externally-driven compaction into its session, which no Pi release does yet.
+- Pi is stateless (`store: false`) and rebuilds the input window from session
+  entries on every request. Until Pi surfaces in-stream compaction items, a
+  server-side compaction would run on nearly every turn over a near-full
+  window and Pi could not reuse the result — strictly more expensive than one
+  compact pass per window-fill.
+
+When Pi adds in-stream compaction support, only this adapter's request half
+changes; the persisted-state replay below it stays as is.
+
 ## Related extensions
 
 This remains separate from:
