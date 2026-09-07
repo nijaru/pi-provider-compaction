@@ -377,6 +377,7 @@ test("leaves unsupported providers on Pi's normal path", async () => {
 		await handler?.({ preparation: {}, branchEntries: [], signal: new AbortController().signal }, { model: unsupported }),
 	).toBeUndefined();
 	expect(supportsNativeCompaction(unsupported)).toBe(false);
+	expect(supportsNativeCompaction(undefined)).toBe(false);
 	expect(supportsNativeCompaction({ ...model, provider: "openai-codex", api: "openai-codex-responses" })).toBe(false);
 	expect(supportsNativeCompaction({ ...model, provider: "xai" })).toBe(false);
 });

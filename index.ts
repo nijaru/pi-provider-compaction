@@ -44,7 +44,7 @@ function isObject(value: unknown): value is JsonObject {
 }
 
 export function supportsNativeCompaction(model: Model<any> | undefined): model is Model<any> {
-	return model?.provider === "openai" && model.api === "openai-responses";
+	return model?.provider === "openai" && model?.api === "openai-responses";
 }
 
 function isCompactionItem(value: unknown): value is ResponseItem {
