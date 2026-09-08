@@ -365,6 +365,33 @@ test("does not anchor on an older duplicate post-compaction message", () => {
 	});
 });
 
+test("matches retained items regardless of key order", () => {
+	// Id-less items skip the id/call_id fast paths and compare by value,
+	// where provider re-serialization may reorder keys.
+	const nativeMessage = {
+		type: "message",
+		role: "assistant",
+		content: [{ type: "output_text", text: "kept" }],
+	} as unknown as Record<string, unknown>;
+	const nativeDetails = details([nativeMessage, compactionItem]);
+	const reorderedKept = {
+		content: [{ text: "kept", type: "output_text" }],
+		role: "assistant",
+		type: "message",
+	} as unknown as Record<string, unknown>;
+	const payload = {
+		model: model.id,
+		input: [{ role: "developer", content: "system" }, reorderedKept, { type: "message", role: "user", content: "new" }],
+	};
+
+	// Empty post-compaction items forces the retained-output fallback path.
+	const rewritten = rewriteResponsesPayload(payload, nativeDetails, []);
+	expect(rewritten).toEqual({
+		...payload,
+		input: [nativeMessage, compactionItem, { type: "message", role: "user", content: "new" }],
+	});
+});
+
 // ── Fallback and precedence in the live hooks ───────────────────────────
 
 test("leaves unsupported providers on Pi's normal path", async () => {

@@ -41,7 +41,8 @@ resolution order as pi-compactor applies:
 1. the `--compaction-model` flag (provided by pi-compactor, which must be
    installed to use it; this extension reads the shared CLI value from
    `process.argv` without re-registering it, since Pi rejects duplicate
-   flag registrations),
+   flag registrations; Pi populates flag values from CLI args, so this
+   observes every flag source the host supports),
 2. a trusted project's `.pi/compaction-policy.json` (`models` list), then
 3. the agent directory's `compaction-policy.json`.
 

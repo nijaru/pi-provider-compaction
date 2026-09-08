@@ -96,6 +96,11 @@ function responseItemsFromMessages(model: Model<any>, messages: AgentMessage[]):
 	const llmMessages = convertToLlm(messages);
 	const input = convertResponsesMessages(
 		model,
+		// tools: [] is intentional: tool definitions are not needed to reserialize
+		// recorded tool calls, and omitting them drops namespaces on cross-model
+		// history instead of risking provider pairing-validation failures.
+		// includeSystemPrompt: false because the system prompt travels in the
+		// standalone compact request's `instructions` field instead.
 		{ messages: llmMessages, tools: [] },
 		TOOL_CALL_PROVIDERS,
 		{ includeSystemPrompt: false },
@@ -147,7 +152,7 @@ export interface CompactRequestOptions {
 }
 
 export async function compactOpenAIResponses(options: CompactRequestOptions): Promise<NativeCompactionDetails> {
-	const endpoint = `${options.baseUrl.replace(/\/$/, "")}/responses/compact`;
+	const endpoint = `${options.baseUrl.replace(/\/+$/, "")}/responses/compact`;
 	const body: JsonObject = {
 		model: options.model.id,
 		input: options.input,
@@ -217,6 +222,18 @@ function nestedNumber(value: unknown, key: string): number {
 	return isObject(value) ? readNumber(value[key]) : 0;
 }
 
+/** Key-order-insensitive serialization for boundary matching: providers may re-serialize retained items with reordered keys. */
+function stableStringify(value: unknown): string {
+	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
+	if (isObject(value)) {
+		const entries = Object.keys(value)
+			.sort()
+			.map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`);
+		return `{${entries.join(",")}}`;
+	}
+	return JSON.stringify(value) ?? "null";
+}
+
 function itemMatches(left: ResponseItem, right: ResponseItem): boolean {
 	const leftId = typeof left.id === "string" ? left.id : undefined;
 	const rightId = typeof right.id === "string" ? right.id : undefined;
@@ -225,9 +242,9 @@ function itemMatches(left: ResponseItem, right: ResponseItem): boolean {
 	const rightCallId = typeof right.call_id === "string" ? right.call_id : undefined;
 	if (leftCallId && rightCallId) return leftCallId === rightCallId && left.type === right.type;
 	if (left.type === "message" && right.type === "message") {
-		return left.role === right.role && JSON.stringify(left.content) === JSON.stringify(right.content);
+		return left.role === right.role && stableStringify(left.content) === stableStringify(right.content);
 	}
-	return JSON.stringify(left) === JSON.stringify(right);
+	return stableStringify(left) === stableStringify(right);
 }
 
 function findLastSubsequence(items: ResponseItem[], sequence: ResponseItem[]): number {
@@ -298,10 +315,12 @@ export default function (pi: ExtensionAPI): void {
 		const index = branch.findIndex((entry) => entry.id === latest.entryId);
 		const postItems = index >= 0 ? responseItemsFromEntries(model, branch.slice(index + 1)) : [];
 		const rewritten = rewriteResponsesPayload(event.payload, latest, postItems);
-		if (rewritten === event.payload || !isObject(rewritten) || !ctx.getSystemPrompt()) return rewritten;
+		if (rewritten === event.payload || !isObject(rewritten)) return rewritten;
+		const systemPrompt = ctx.getSystemPrompt();
+		if (!systemPrompt) return rewritten;
 		// openai-responses normally carries the system prompt as an input item. Move
 		// it to `instructions` so replacing the input window cannot drop it.
-		return { ...rewritten, instructions: ctx.getSystemPrompt() };
+		return { ...rewritten, instructions: systemPrompt };
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {

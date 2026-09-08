@@ -14,7 +14,18 @@
  * fallback mirrors pi-compactor exactly: project policy requires project
  * trust; the agent-dir policy does not; a valid file with an empty `models`
  * list disables the generic model. This module must stay in sync with
- * `readModelSelectors` in pi-compactor's policy.ts.
+ * `readModelSelectors` in pi-compactor's policy.ts (see
+ * tests/policy-parity.test.ts, which checks the two against each other when
+ * the sibling checkout is present).
+ *
+ * Flag-source note (verified against Pi 0.85.1): extension flag values are
+ * populated solely from CLI unknown flags (parseArgs in cli/args.js feeds
+ * extensionFlagValues in main.js, applied by applyExtensionFlagValues in
+ * agent-session-services.js). There is no config-file flag source, so reading
+ * process.argv with Pi's exact parsing rules observes every flag value the
+ * host can deliver. A programmatic SDK host injecting extensionFlagValues
+ * without argv would not be seen here; flag scoping provides no shared read
+ * API for that path.
  */
 
 import {
