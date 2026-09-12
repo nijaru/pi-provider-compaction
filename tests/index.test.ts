@@ -154,7 +154,7 @@ describe("standalone Responses bridge", () => {
 			headers: { "api-key": "secret" },
 			env: { AZURE_OPENAI_API_VERSION: "2026-08-01" },
 			signal: new AbortController().signal,
-			fetch: (async (input, init) => {
+			fetch: (async (input: string | URL, init?: RequestInit) => {
 				compactUrl = String(input);
 				compactInit = init;
 				return new Response(

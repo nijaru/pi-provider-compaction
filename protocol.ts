@@ -213,7 +213,7 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 	let bridgeError: unknown;
 	let dispatches = 0;
 	const baseFetch = request.fetch ?? globalThis.fetch;
-	const bridgeFetch = (async (input, init) => {
+	const bridgeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		if (request.signal.aborted) throw new DOMException("Compaction aborted", "AbortError");
 		dispatches += 1;
 		if (dispatches !== 1 || !preparedPayload) {
@@ -360,7 +360,7 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 	const baseFetch = request.fetch ?? globalThis.fetch;
 	let sentInput: ResponseItem[] | undefined;
 	const inspections: Promise<CollectedSse>[] = [];
-	const inspectedFetch = (async (input, init) => {
+	const inspectedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const response = await baseFetch(input, init);
 		if (!response.ok || !response.body) return response;
 		const [providerBody, inspectionBody] = response.body.tee();
