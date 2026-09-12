@@ -1,581 +1,315 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { describe, expect, test } from "bun:test";
 import type { Model, Usage } from "@earendil-works/pi-ai";
-import type { ExtensionAPI, SessionEntry } from "@earendil-works/pi-coding-agent";
-import extension, {
+import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import {
 	NATIVE_COMPACTION_SUMMARY,
 	NATIVE_COMPACTION_TYPE,
 	NATIVE_COMPACTION_VERSION,
 	compactOpenAIResponses,
 	findLatestNativeCompaction,
-	type NativeCompactionDetails,
+	readNativeCompactionDetails,
 	rewriteResponsesPayload,
 	supportsNativeCompaction,
+	type NativeCompactionDetails,
 } from "../index";
-import { readCompactionModelFlagFromArgv, resolveCompactionModelPolicy } from "../policy";
+import {
+	requestProviderCompaction,
+	resolveNativeProtocol,
+	responsesCompactUrl,
+	validateCompactedOutput,
+	type ResponseItem,
+} from "../protocol";
 
-const model = {
+const usage: Usage = {
+	input: 10,
+	output: 5,
+	cacheRead: 0,
+	cacheWrite: 0,
+	totalTokens: 15,
+	cost: { input: 0.01, output: 0.02, cacheRead: 0, cacheWrite: 0, total: 0.03 },
+};
+
+const directModel = {
 	provider: "openai",
 	api: "openai-responses",
-	id: "gpt-5.3-codex",
+	id: "gpt-test",
 	baseUrl: "https://api.openai.com/v1",
 	input: ["text"],
 	cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0.25 },
 } as unknown as Model<any>;
 
-const compactionItem: Record<string, unknown> = {
-	type: "compaction",
-	encrypted_content: "opaque-state",
-};
+const codexModel = {
+	...directModel,
+	provider: "openai-codex",
+	api: "openai-codex-responses",
+	baseUrl: "https://chatgpt.com/backend-api",
+} as unknown as Model<any>;
 
-let agentDir: string;
-let projectDir: string;
+const azureModel = {
+	...directModel,
+	provider: "azure-openai-responses",
+	api: "azure-openai-responses",
+	baseUrl: "https://example.openai.azure.com/openai/v1",
+} as unknown as Model<any>;
 
-beforeAll(() => {
-	agentDir = mkdtempSync(join(tmpdir(), "pi-pc-agent-"));
-	projectDir = mkdtempSync(join(tmpdir(), "pi-pc-project-"));
-	// Point the shared agent-dir resolution at an empty temp dir so tests do not
-	// read the real ~/.pi/agent/compaction-policy.json.
-	process.env.PI_COMPACTOR_AGENT_DIR = agentDir;
-});
+const checkpoint = { type: "compaction", encrypted_content: "opaque-state" } as ResponseItem;
 
-afterAll(() => {
-	delete process.env.PI_COMPACTOR_AGENT_DIR;
-	rmSync(agentDir, { recursive: true, force: true });
-	rmSync(projectDir, { recursive: true, force: true });
-});
-
-function details(output: Record<string, unknown>[] = [compactionItem]): NativeCompactionDetails {
+function asyncStream(run: () => Promise<void>, streamUsage: Usage = usage): any {
 	return {
-		type: NATIVE_COMPACTION_TYPE,
-		version: NATIVE_COMPACTION_VERSION,
-		provider: model.provider,
-		api: model.api,
-		model: model.id,
-		output,
+		async *[Symbol.asyncIterator]() {
+			await run();
+			yield {
+				type: "done",
+				reason: "stop",
+				message: { usage: streamUsage, stopReason: "stop", content: [] },
+			};
+		},
 	};
 }
 
-function compactionEntry(nativeDetails = details()): SessionEntry {
+function details(overrides: Partial<NativeCompactionDetails> = {}): NativeCompactionDetails {
+	return {
+		type: NATIVE_COMPACTION_TYPE,
+		version: NATIVE_COMPACTION_VERSION,
+		provider: directModel.provider,
+		api: directModel.api,
+		model: directModel.id,
+		protocol: "responses-compact",
+		identity: { endpoint: directModel.baseUrl },
+		output: [checkpoint],
+		...overrides,
+	};
+}
+
+function compactionEntry(native = details(), summary = "portable summary"): SessionEntry {
 	return {
 		type: "compaction",
 		id: "compact-1",
 		parentId: "message-1",
 		timestamp: new Date().toISOString(),
-		summary: NATIVE_COMPACTION_SUMMARY,
+		summary,
 		firstKeptEntryId: "message-1",
 		tokensBefore: 123,
-		details: nativeDetails,
+		details: native,
 	} as SessionEntry;
 }
 
-/** Mock pi with the real loader semantics: getFlag only sees registered flags. */
-function createPi(flagValues: Record<string, string | boolean> = {}) {
-	const handlers = new Map<string, (event: any, ctx: any) => unknown>();
-	const flags = new Set<string>();
-	const values = new Map(Object.entries(flagValues));
-	return {
-		pi: {
-			on(name: string, handler: (event: any, ctx: any) => unknown) {
-				handlers.set(name, handler);
-			},
-			registerFlag(name: string) {
-				flags.add(name);
-			},
-			getFlag(name: string) {
-				return flags.has(name) ? values.get(name) : undefined;
-			},
-		} as unknown as ExtensionAPI,
-		handlers,
-		flags,
-	};
-}
-
-function writeAgentPolicy(models: string[]) {
-	writeFileSync(join(agentDir, "compaction-policy.json"), JSON.stringify({ models }));
-}
-
-function writeProjectPolicy(models: string[]) {
-	mkdirSync(join(projectDir, ".pi"), { recursive: true });
-	// A trust-requiring resource (checked by hasTrustRequiringProjectResources)
-	// plus isProjectTrusted=true is what pi-compactor requires to read project policy.
-	writeFileSync(join(projectDir, ".pi", "settings.json"), "{}");
-	writeFileSync(join(projectDir, ".pi", "compaction-policy.json"), JSON.stringify({ models }));
-}
-
-function policyCtx(trusted = true) {
-	return {
-		cwd: projectDir,
-		isProjectTrusted: () => trusted,
-	};
-}
-
-// ── Policy precedence ───────────────────────────────────────────────────
-
-describe("generic-compaction-model precedence", () => {
-	test("does not register a duplicate flag owned by pi-compactor", () => {
-		const { pi, flags } = createPi();
-		extension(pi);
-		// Pi rejects two extensions registering the same flag; this extension
-		// must not register `compaction-model` at all.
-		expect([...flags].join(",")).not.toContain("compaction-model");
+describe("automatic route resolution", () => {
+	test("uses standalone compact for Responses and Remote V2 for Codex", () => {
+		expect(resolveNativeProtocol(directModel)).toBe("responses-compact");
+		expect(resolveNativeProtocol(azureModel)).toBe("responses-compact");
+		expect(resolveNativeProtocol(codexModel)).toBe("remote-v2");
+		expect(supportsNativeCompaction(directModel)).toBe(true);
+		expect(supportsNativeCompaction(azureModel)).toBe(true);
+		expect(supportsNativeCompaction(codexModel)).toBe(true);
+		expect(supportsNativeCompaction({ ...directModel, api: "anthropic-messages" })).toBe(false);
 	});
 
-	test("flag takes precedence via process.argv without registration", () => {
-		const { pi, handlers, flags } = createPi();
-		extension(pi);
-		expect(handlers.get("session_before_compact")).toBeDefined();
-		expect(flags.has("compaction-model")).toBe(false);
-		expect(
-			resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model", "openrouter/deepseek/deepseek-v4-flash"]),
-		).toEqual({ hasSelectors: true, source: "flag" });
-		expect(
-			resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model=openrouter/deepseek/deepseek-v4-flash"]),
-		).toEqual({ hasSelectors: true, source: "flag" });
-	});
-
-	test("argv flag parsing matches Pi semantics", () => {
-		expect(readCompactionModelFlagFromArgv(["--compaction-model", "openrouter/a"])).toBe("openrouter/a");
-		expect(readCompactionModelFlagFromArgv(["--compaction-model=openrouter/a"])).toBe("openrouter/a");
-		expect(readCompactionModelFlagFromArgv(["--compaction-model"])).toBe(true);
-		// Stops at `--`; last occurrence wins.
-		expect(readCompactionModelFlagFromArgv(["--compaction-model", "openrouter/a", "--", "--compaction-model", "openrouter/b"])).toBe(
-			"openrouter/a",
+	test("derives /responses/compact without changing Azure query semantics", () => {
+		const url = responsesCompactUrl(
+			"https://example.openai.azure.com/openai/v1/responses?api-version=2026-08-01",
 		);
-		expect(readCompactionModelFlagFromArgv(["--compaction-model", "openrouter/a", "--compaction-model", "openrouter/b"])).toBe(
-			"openrouter/b",
+		expect(url.toString()).toBe(
+			"https://example.openai.azure.com/openai/v1/responses/compact?api-version=2026-08-01",
 		);
-		// A bare flag falls through to policy files like Pi's "requires a value".
-		const { pi } = createPi();
-		writeAgentPolicy(["openrouter/deepseek/deepseek-v4-flash"]);
-		try {
-			expect(resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model"])).toEqual({
-				hasSelectors: true,
-				source: "agent-policy",
-			});
-		} finally {
-			writeAgentPolicy([]);
-		}
-	});
-
-	test("policy files with selectors take precedence when the flag is unset", () => {
-		const { pi } = createPi();
-		extension(pi);
-		try {
-			writeAgentPolicy(["openrouter/deepseek/deepseek-v4-flash"]);
-			expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: true, source: "agent-policy" });
-
-			writeProjectPolicy(["openai/gpt-5.2"]);
-			expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: true, source: "project-policy" });
-
-			// An untrusted project policy must not be read.
-			expect(resolveCompactionModelPolicy(pi, policyCtx(false), []).source).toBe("agent-policy");
-		} finally {
-			rmSync(join(projectDir, ".pi", "compaction-policy.json"), { force: true });
-		}
-	});
-
-	test("an empty models list is an explicit no-generic-model choice", () => {
-		const { pi } = createPi();
-		extension(pi);
-		writeAgentPolicy([]);
-		expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: false });
-	});
-
-	test("a malformed or oversized policy falls back to no selectors", () => {
-		const { pi } = createPi();
-		extension(pi);
-		writeFileSync(join(agentDir, "compaction-policy.json"), "{not json");
-		expect(resolveCompactionModelPolicy(pi, policyCtx(), [])).toEqual({ hasSelectors: false });
-	});
-
-	test("a whitespace or oversized flag falls back like pi-compactor", () => {
-		const { pi } = createPi();
-		extension(pi);
-		// Whitespace falls through to policy files; with an explicit empty
-		// agent policy that means no generic model.
-		writeAgentPolicy([]);
-		try {
-			expect(resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model", "   "]).hasSelectors).toBe(false);
-			// Oversized selectors are rejected without falling through.
-			expect(resolveCompactionModelPolicy(pi, policyCtx(), ["--compaction-model", `openrouter/${"a".repeat(600)}`])).toEqual({
-				hasSelectors: false,
-			});
-		} finally {
-			writeAgentPolicy([]);
-		}
 	});
 });
 
-// ── Compaction request shaping ──────────────────────────────────────────
-
-test("shapes the standalone compact request and preserves opaque output", async () => {
-	let requestUrl = "";
-	let requestInit: RequestInit | undefined;
-	const fetchImpl = (async (input: RequestInfo | URL, init?: RequestInit) => {
-		requestUrl = String(input);
-		requestInit = init;
-		return new Response(
-			JSON.stringify({
-				output: [compactionItem, { type: "message", id: "kept" }],
-				usage: {
-					input_tokens: 200,
-					input_tokens_details: { cached_tokens: 50, cache_write_tokens: 25 },
-					output_tokens: 100,
-					output_tokens_details: { reasoning_tokens: 64 },
-					total_tokens: 300,
-				},
-			}),
-			{ status: 200, headers: { "content-type": "application/json" } },
-		);
-	}) as unknown as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-
-	const result = await compactOpenAIResponses({
-		model,
-		baseUrl: "https://api.openai.com/v1/",
-		apiKey: "secret",
-		headers: { Authorization: null, "x-test": "yes" },
-		input: [{ type: "message", role: "user", content: "hello" }],
-		instructions: "system",
-		fetchImpl,
-	});
-
-	expect(requestUrl).toBe("https://api.openai.com/v1/responses/compact");
-	expect(requestInit?.method).toBe("POST");
-	expect(requestInit?.headers).toEqual({
-		"content-type": "application/json",
-		"x-test": "yes",
-		authorization: "Bearer secret",
-	});
-	expect(JSON.parse(String(requestInit?.body))).toEqual({
-		model: model.id,
-		input: [{ type: "message", role: "user", content: "hello" }],
-		instructions: "system",
-	});
-	expect(result.output).toEqual([compactionItem, { type: "message", id: "kept" }]);
-});
-
-test("maps the compact response usage onto Pi's Usage with cost applied", async () => {
-	const fetchImpl = (async () =>
-		new Response(
-			JSON.stringify({
-				output: [compactionItem],
-				usage: {
-					input_tokens: 200,
-					input_tokens_details: { cached_tokens: 50, cache_write_tokens: 25 },
-					output_tokens: 100,
-					output_tokens_details: { reasoning_tokens: 64 },
-					total_tokens: 300,
-				},
-			}),
-		)) as unknown as (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
-
-	const result = await compactOpenAIResponses({ model, baseUrl: "https://api.openai.com/v1", input: [], fetchImpl });
-	const usage: Usage = result.usage!;
-	// OpenAI counts cached and cache-write tokens inside input_tokens.
-	expect(usage.input).toBe(125);
-	expect(usage.cacheRead).toBe(50);
-	expect(usage.cacheWrite).toBe(25);
-	expect(usage.reasoning).toBe(64);
-	expect(usage.output).toBe(100);
-	expect(usage.totalTokens).toBe(300);
-	expect(usage.cost.total).toBeCloseTo((125 * 1 + 100 * 2 + 50 * 0.5 + 25 * 0.25) / 1_000_000, 12);
-});
-
-test("rejects a compact response without opaque state", async () => {
-	const fetchImpl = (async () => new Response(JSON.stringify({ output: [{ type: "message" }] }))) as unknown as (
-		input: RequestInfo | URL,
-		init?: RequestInit,
-	) => Promise<Response>;
-	await expect(
-		compactOpenAIResponses({
-			model,
-			baseUrl: "https://api.openai.com/v1",
-			input: [],
-			fetchImpl,
-		}),
-	).rejects.toThrow("opaque compaction state");
-});
-
-test("includes the provider error body when the compact request fails", async () => {
-	const fetchImpl = (async () =>
-		new Response(JSON.stringify({ error: { message: "rate limited" } }), { status: 429 })) as unknown as (
-		input: RequestInfo | URL,
-		init?: RequestInit,
-	) => Promise<Response>;
-	await expect(
-		compactOpenAIResponses({
-			model,
-			baseUrl: "https://api.openai.com/v1",
-			input: [],
-			fetchImpl,
-		}),
-	).rejects.toThrow('failed (429: {"error":{"message":"rate limited"}})');
-});
-
-// ── Restore and replay ──────────────────────────────────────────────────
-
-test("restores the latest provider state only for the same model", () => {
-	const entry = compactionEntry();
-	expect(findLatestNativeCompaction([entry], model)?.output).toEqual([compactionItem]);
-	expect(findLatestNativeCompaction([entry], { ...model, id: "other" })).toBeUndefined();
-	expect(findLatestNativeCompaction([{ ...entry, details: { type: "other" } } as SessionEntry], model)).toBeUndefined();
-});
-
-test("replaces old context and retains items after the native window", () => {
-	const nativeMessage = { type: "message", id: "kept", role: "assistant" } as Record<string, unknown>;
-	const nativeDetails = details([nativeMessage, compactionItem]);
-	const payload = {
-		model: model.id,
-		input: [
-			{ role: "developer", content: "system" },
-			nativeMessage,
-			{ type: "message", role: "user", content: "new" },
-		],
-	};
-
-	const rewritten = rewriteResponsesPayload(payload, nativeDetails, [payload.input[2]]);
-	expect(rewritten).toEqual({
-		...payload,
-		input: [nativeMessage, compactionItem, { type: "message", role: "user", content: "new" }],
-	});
-	expect(rewritten).not.toBe(payload);
-});
-
-test("does not anchor on an older duplicate post-compaction message", () => {
-	const nativeMessage = { type: "message", id: "kept", role: "assistant" } as Record<string, unknown>;
-	const repeatedUser = { type: "message", role: "user", content: "same" } as Record<string, unknown>;
-	const intervening = {
-		type: "message",
-		role: "assistant",
-		content: [{ type: "output_text", text: "between" }],
-	} as Record<string, unknown>;
-	const nativeDetails = details([nativeMessage, compactionItem]);
-	const payload = {
-		model: model.id,
-		input: [nativeMessage, repeatedUser, intervening, repeatedUser],
-	};
-
-	const rewritten = rewriteResponsesPayload(payload, nativeDetails, [repeatedUser, intervening, repeatedUser]);
-	expect(rewritten).toEqual({
-		...payload,
-		input: [nativeMessage, compactionItem, repeatedUser, intervening, repeatedUser],
-	});
-});
-
-test("matches retained items regardless of key order", () => {
-	// Id-less items skip the id/call_id fast paths and compare by value,
-	// where provider re-serialization may reorder keys.
-	const nativeMessage = {
-		type: "message",
-		role: "assistant",
-		content: [{ type: "output_text", text: "kept" }],
-	} as unknown as Record<string, unknown>;
-	const nativeDetails = details([nativeMessage, compactionItem]);
-	const reorderedKept = {
-		content: [{ text: "kept", type: "output_text" }],
-		role: "assistant",
-		type: "message",
-	} as unknown as Record<string, unknown>;
-	const payload = {
-		model: model.id,
-		input: [{ role: "developer", content: "system" }, reorderedKept, { type: "message", role: "user", content: "new" }],
-	};
-
-	// Empty post-compaction items forces the retained-output fallback path.
-	const rewritten = rewriteResponsesPayload(payload, nativeDetails, []);
-	expect(rewritten).toEqual({
-		...payload,
-		input: [nativeMessage, compactionItem, { type: "message", role: "user", content: "new" }],
-	});
-});
-
-// ── Fallback and precedence in the live hooks ───────────────────────────
-
-test("leaves unsupported providers on Pi's normal path", async () => {
-	const { pi, handlers } = createPi();
-	extension(pi);
-	const handler = handlers.get("session_before_compact");
-	expect(handler).toBeDefined();
-	const unsupported = { ...model, api: "anthropic-messages" } as Model<any>;
-	expect(
-		await handler?.({ preparation: {}, branchEntries: [], signal: new AbortController().signal }, { model: unsupported }),
-	).toBeUndefined();
-	expect(supportsNativeCompaction(unsupported)).toBe(false);
-	expect(supportsNativeCompaction(undefined)).toBe(false);
-	expect(supportsNativeCompaction({ ...model, provider: "openai-codex", api: "openai-codex-responses" })).toBe(false);
-	expect(supportsNativeCompaction({ ...model, provider: "xai" })).toBe(false);
-});
-
-test("a configured generic model suppresses both the native request and replay", async () => {
-	writeAgentPolicy(["openrouter/deepseek/deepseek-v4-flash"]);
-	try {
-		const { pi, handlers } = createPi();
-		extension(pi);
-
-		// Compaction hook must make no network attempt: no auth resolution at all.
-		let authCalls = 0;
-		const compactHandler = handlers.get("session_before_compact");
-		expect(
-			await compactHandler?.(
-				{ preparation: {}, branchEntries: [], signal: new AbortController().signal },
-				{
-					model,
-					isProjectTrusted: () => false,
-					cwd: projectDir,
-					modelRegistry: {
-						getApiKeyAndHeaders: async () => {
-							authCalls += 1;
-							return { ok: true };
+describe("standalone Responses bridge", () => {
+	test("lets the active provider build auth/url then redirects exactly one request to /compact", async () => {
+		let sentPayload: any;
+		let compactUrl = "";
+		let compactInit: RequestInit | undefined;
+		const provider = {
+			stream(_model: any, _context: any, options: any) {
+				return asyncStream(async () => {
+					sentPayload = await options.onPayload({
+						model: "azure-deployment",
+						input: [{ type: "message", role: "user", content: "provider-built" }],
+						stream: true,
+						store: false,
+						prompt_cache_key: "session",
+					});
+					const response = await options.fetch(
+						"https://example.openai.azure.com/openai/v1/responses?api-version=2026-08-01",
+						{
+							method: "POST",
+							headers: { "api-key": "secret", "content-encoding": "gzip" },
+							body: "provider body is replaced by bridge",
 						},
-					},
-				},
-			),
-		).toBeUndefined();
-		expect(authCalls).toBe(0);
+					);
+					expect(response.ok).toBe(true);
+					await response.text();
+				});
+			},
+		} as any;
 
-		// Replay hook must not resurrect a persisted native window that the
-		// generic compaction has already summarized away.
-		const kept = { type: "message", id: "kept", role: "assistant" } as Record<string, unknown>;
-		const entry = compactionEntry(details([kept, compactionItem]));
-		const requestHandler = handlers.get("before_provider_request");
-		expect(
-			await requestHandler?.(
-				{ payload: { model: model.id, input: [{ role: "developer", content: "old system" }, kept] } },
-				{
-					model,
-					cwd: projectDir,
-					isProjectTrusted: () => false,
-					getSystemPrompt: () => "current system",
-					sessionManager: { getBranch: () => [entry] },
-				},
-			),
-		).toBeUndefined();
-	} finally {
-		writeAgentPolicy([]); // restore the explicit-no-selector agent policy
-	}
-});
+		const result = await requestProviderCompaction({
+			provider,
+			model: azureModel,
+			context: { systemPrompt: "system", messages: [], tools: [] },
+			protocol: "responses-compact",
+			input: [{ type: "message", role: "user", content: "native-history" }],
+			apiKey: "secret",
+			headers: { "api-key": "secret" },
+			env: { AZURE_OPENAI_API_VERSION: "2026-08-01" },
+			signal: new AbortController().signal,
+			fetch: (async (input, init) => {
+				compactUrl = String(input);
+				compactInit = init;
+				return new Response(
+					JSON.stringify({
+						id: "resp-1",
+						output: [{ type: "message", role: "user", content: [{ type: "input_text", text: "kept" }] }, checkpoint],
+						usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 },
+					}),
+					{ status: 200, headers: { "content-type": "application/json" } },
+				);
+			}) as typeof fetch,
+		});
 
-test("replays native state without dropping the system prompt", async () => {
-	const { pi, handlers } = createPi();
-	extension(pi);
-	const handler = handlers.get("before_provider_request");
-	const kept = { type: "message", id: "kept", role: "assistant" } as Record<string, unknown>;
-	const entry = compactionEntry(details([kept, compactionItem]));
-	const payload = {
-		model: model.id,
-		input: [{ role: "developer", content: "old system" }, kept],
-	};
-	const rewritten = await handler?.(
-		{ payload },
-		{
-			model,
-			cwd: projectDir,
-			isProjectTrusted: () => false,
-			getSystemPrompt: () => "current system",
-			sessionManager: { getBranch: () => [entry] },
-		},
-	);
-	expect(rewritten).toEqual({
-		...payload,
-		input: [kept, compactionItem],
-		instructions: "current system",
+		expect(sentPayload.input).toEqual([{ type: "message", role: "user", content: "native-history" }]);
+		expect(compactUrl).toBe(
+			"https://example.openai.azure.com/openai/v1/responses/compact?api-version=2026-08-01",
+		);
+		const headers = new Headers(compactInit?.headers);
+		expect(headers.get("api-key")).toBe("secret");
+		expect(headers.get("content-encoding")).toBeNull();
+		expect(JSON.parse(String(compactInit?.body))).toEqual({
+			model: "azure-deployment",
+			input: [{ type: "message", role: "user", content: "native-history" }],
+			prompt_cache_key: "session",
+		});
+		expect(result.output.at(-1)).toEqual(checkpoint);
+		expect(result.usage).toEqual(usage);
+	});
+
+	test("preserves the full canonical compact output and rejects malformed checkpoints", () => {
+		const retained = { type: "message", role: "user", content: [{ type: "input_text", text: "kept" }] };
+		expect(validateCompactedOutput({ output: [retained, checkpoint] })).toEqual([retained, checkpoint]);
+		expect(() => validateCompactedOutput({ output: [retained] })).toThrow("expected exactly one");
+		expect(() => validateCompactedOutput({ output: [checkpoint, checkpoint] })).toThrow("expected exactly one");
 	});
 });
 
-test("replay with an empty system prompt rewrites the window without instructions", async () => {
-	const { pi, handlers } = createPi();
-	extension(pi);
-	const handler = handlers.get("before_provider_request");
-	const kept = { type: "message", id: "kept", role: "assistant" } as Record<string, unknown>;
-	const entry = compactionEntry(details([kept, compactionItem]));
-	const payload = { model: model.id, input: [kept] };
-	const rewritten = await handler?.(
-		{ payload },
-		{
-			model,
-			cwd: projectDir,
-			isProjectTrusted: () => false,
-			getSystemPrompt: () => "",
-			sessionManager: { getBranch: () => [entry] },
-		},
-	);
-	expect(rewritten).toEqual({ ...payload, input: [kept, compactionItem] });
-	expect((rewritten as Record<string, unknown>).instructions).toBeUndefined();
+describe("Codex Remote V2 bridge", () => {
+	test("appends compaction_trigger through Pi's Codex transport and captures the emitted checkpoint", async () => {
+		let prepared: any;
+		const provider = {
+			stream(_model: any, _context: any, options: any) {
+				return asyncStream(async () => {
+					prepared = await options.onPayload({ model: codexModel.id, input: [{ type: "message", role: "user", content: [] }] });
+					const response = await options.fetch("https://chatgpt.com/backend-api/codex/responses", {
+						method: "POST",
+						headers: { authorization: "Bearer oauth", "chatgpt-account-id": "acct" },
+						body: JSON.stringify(prepared),
+					});
+					expect(response.ok).toBe(true);
+					await response.text();
+				});
+			},
+		} as any;
+		const user = { type: "message", role: "user", content: [{ type: "input_text", text: "recent" }] };
+		const result = await requestProviderCompaction({
+			provider,
+			model: codexModel,
+			context: { systemPrompt: "system", messages: [], tools: [] },
+			protocol: "remote-v2",
+			input: [user, { type: "message", role: "assistant", content: [] }],
+			apiKey: "oauth",
+			signal: new AbortController().signal,
+			fetch: (async () => {
+				const events = [
+					{ type: "response.output_item.done", item: checkpoint },
+					{ type: "response.completed", response: { output: [checkpoint] } },
+				];
+				return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), {
+					status: 200,
+					headers: { "content-type": "text/event-stream" },
+				});
+			}) as typeof fetch,
+		});
+
+		expect(prepared.input.at(-1)).toEqual({ type: "compaction_trigger" });
+		expect(result.output).toEqual([user, checkpoint]);
+		expect(result.usage.totalTokens).toBe(15);
+	});
 });
 
-// ── Native compaction request composition ───────────────────────────────
+describe("persistence and replay", () => {
+	test("reads legacy v1 details but writes v2 protocol state", () => {
+		const legacy = readNativeCompactionDetails({
+			type: NATIVE_COMPACTION_TYPE,
+			version: 1,
+			provider: directModel.provider,
+			api: directModel.api,
+			model: directModel.id,
+			output: [checkpoint],
+			usage,
+		});
+		expect(legacy?.protocol).toBe("responses-compact");
+		expect(legacy?.nativeUsage).toEqual(usage);
+		expect(legacy?.identity).toBeUndefined();
+		expect(NATIVE_COMPACTION_SUMMARY.length).toBeGreaterThan(0);
+	});
 
-test("chains a second native compaction on the previous opaque window", async () => {
-	const { pi, handlers } = createPi();
-	extension(pi);
-	const handler = handlers.get("session_before_compact");
+	test("matches model and route identity and stops at a newer non-native compaction", () => {
+		const native = compactionEntry();
+		expect(findLatestNativeCompaction([native], directModel, { endpoint: directModel.baseUrl })?.output).toEqual([checkpoint]);
+		expect(findLatestNativeCompaction([native], { ...directModel, id: "other" }, { endpoint: directModel.baseUrl })).toBeUndefined();
+		expect(findLatestNativeCompaction([native], directModel, { endpoint: "https://proxy.example/v1" })).toBeUndefined();
+		const generic = { ...native, id: "compact-2", details: { readFiles: [] }, summary: "new portable summary" } as SessionEntry;
+		expect(findLatestNativeCompaction([native, generic], directModel, { endpoint: directModel.baseUrl })).toBeUndefined();
+	});
 
-	const kept = { type: "message", id: "kept", role: "assistant" } as Record<string, unknown>;
-	const previousEntry = compactionEntry(details([kept, compactionItem]));
-	previousEntry.id = "compact-0";
-	const followUp = {
-		type: "message",
-		id: "m2",
-		parentId: "compact-0",
-		timestamp: new Date().toISOString(),
-		message: { role: "user", content: [{ type: "text", text: "next turn" }] },
-	} as SessionEntry;
+	test("replaces portable summary payload with native state while retaining post-compaction messages", () => {
+		const kept = { type: "message", id: "kept", role: "assistant", content: [] } as ResponseItem;
+		const native = details({ output: [kept, checkpoint] });
+		const after = { type: "message", role: "user", content: "after" } as ResponseItem;
+		const payload = { model: directModel.id, input: [kept, after] };
+		expect(rewriteResponsesPayload(payload, native, [after])).toEqual({
+			model: directModel.id,
+			input: [kept, checkpoint, after],
+		});
+	});
+});
 
-	let requestBody: any;
-	const originalFetch = globalThis.fetch;
-	globalThis.fetch = (async (_input: RequestInfo | URL, init?: RequestInit) => {
-		requestBody = JSON.parse(String(init?.body));
-		return new Response(
-			JSON.stringify({
-				output: [compactionItem],
-				usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15 },
-			}),
-			{ status: 200 },
-		);
-	}) as typeof fetch;
-	try {
-		const result = await handler?.(
-			{
-				preparation: { firstKeptEntryId: "m2", tokensBefore: 500 },
-				branchEntries: [previousEntry, followUp],
-				signal: new AbortController().signal,
+describe("legacy direct helper", () => {
+	test("keeps request shaping and usage accounting for deterministic fixtures", async () => {
+		let url = "";
+		let init: RequestInit | undefined;
+		const result = await compactOpenAIResponses({
+			model: directModel,
+			baseUrl: "https://api.openai.com/v1/",
+			apiKey: "secret",
+			headers: { Authorization: null, "x-test": "yes" },
+			input: [{ type: "message", role: "user", content: "hello" }],
+			instructions: "system",
+			fetchImpl: async (input: RequestInfo | URL, requestInit?: RequestInit) => {
+				url = String(input);
+				init = requestInit;
+				return new Response(JSON.stringify({
+					output: [checkpoint],
+					usage: {
+						input_tokens: 200,
+						input_tokens_details: { cached_tokens: 50, cache_write_tokens: 25 },
+						output_tokens: 100,
+						output_tokens_details: { reasoning_tokens: 64 },
+						total_tokens: 300,
+					},
+				}));
 			},
-			{
-				model,
-				cwd: projectDir,
-				isProjectTrusted: () => false,
-				getSystemPrompt: () => "current system",
-				sessionManager: {
-					getBranch: () => [previousEntry, followUp],
-					buildContextEntries: () => [previousEntry, followUp],
-				},
-				modelRegistry: {
-					getApiKeyAndHeaders: async () => ({
-						ok: true,
-						apiKey: "secret",
-						headers: {},
-						baseUrl: "https://api.openai.com/v1",
-					}),
-				},
-			},
-		);
-
-		// The request chains the previous opaque window plus post-compaction entries,
-		// with the system prompt folded into instructions. Retained items come
-		// before the compaction item in the previous window's canonical output.
-		expect(requestBody.model).toBe(model.id);
-		expect(requestBody.input.length).toBe(3);
-		expect(requestBody.input[0]).toEqual(kept);
-		expect(requestBody.input[1]).toEqual(compactionItem);
-		expect(requestBody.instructions).toBe("current system");
-		// The result carries usage through to Pi's compaction entry.
-		const compaction = (result as { compaction: { usage?: Usage; details: NativeCompactionDetails } }).compaction;
-		expect(compaction.usage?.totalTokens).toBe(15);
-		expect(compaction.details.output).toEqual([compactionItem]);
-	} finally {
-		globalThis.fetch = originalFetch;
-	}
+		});
+		expect(url).toBe("https://api.openai.com/v1/responses/compact");
+		expect(JSON.parse(String(init?.body))).toEqual({
+			model: directModel.id,
+			input: [{ type: "message", role: "user", content: "hello" }],
+			instructions: "system",
+		});
+		expect(result.nativeUsage?.input).toBe(125);
+		expect(result.nativeUsage?.cacheRead).toBe(50);
+		expect(result.nativeUsage?.cacheWrite).toBe(25);
+		expect(result.nativeUsage?.reasoning).toBe(64);
+		expect(result.usage).toEqual(result.nativeUsage);
+	});
 });

@@ -24,12 +24,13 @@
   },
   "scripts": {
     "test": "bun test",
-    "lint": "oxlint index.ts policy.ts tests/",
+    "lint": "oxlint index.ts protocol.ts policy.ts tests/",
     "typecheck": "tsc --noEmit",
-    "check": "bun test && oxlint index.ts policy.ts tests/ && tsc --noEmit"
+    "check": "bun test && oxlint index.ts protocol.ts policy.ts tests/ && tsc --noEmit"
   },
   "files": [
     "index.ts",
+    "protocol.ts",
     "policy.ts",
     "README.md",
     "LICENSE"
