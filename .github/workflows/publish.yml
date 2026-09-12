@@ -1,9 +1,7 @@
 name: publish
 
 on:
-  push:
-    tags:
-      - "v*"
+  workflow_dispatch:
 
 permissions:
   id-token: write
@@ -24,6 +22,4 @@ jobs:
           package-manager-cache: false
       - run: bun install --frozen-lockfile
       - run: bun run check
-      - name: Verify tag matches package version
-        run: test "v$(node -p "require('./package.json').version")" = "${GITHUB_REF_NAME}"
       - run: npm publish --provenance
