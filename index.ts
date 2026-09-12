@@ -126,7 +126,7 @@ export function readNativeCompactionDetails(value: unknown): NativeCompactionDet
 }
 
 function identityEqual(left: NativeIdentity | undefined, right: NativeIdentity | undefined): boolean {
-	if (!left) return true; // Legacy checkpoints did not persist route identity.
+	if (!left) return true;
 	if (!right) return false;
 	return left.endpoint === right.endpoint && left.organization === right.organization && left.project === right.project && left.accountId === right.accountId && left.azureApiVersion === right.azureApiVersion && left.azureDeployment === right.azureDeployment;
 }
@@ -156,7 +156,7 @@ function responseItemsFromMessages(model: Model<any>, messages: AgentMessage[]):
 		TOOL_CALL_PROVIDERS,
 		{ includeSystemPrompt: false },
 	);
-	return input.filter(isObject) as ResponseItem[];
+	return input.filter(isObject) as unknown as ResponseItem[];
 }
 
 function responseItemsFromEntries(model: Model<any>, entries: readonly SessionEntry[]): ResponseItem[] {
@@ -201,7 +201,6 @@ export interface CompactRequestOptions {
 	fetchImpl?: FetchImplementation;
 }
 
-/** Legacy/test helper for the direct standalone endpoint. Runtime calls use Pi's provider transport below. */
 export async function compactOpenAIResponses(options: CompactRequestOptions): Promise<NativeCompactionDetails> {
 	const endpoint = `${options.baseUrl.replace(/\/+$/, "")}/responses/compact`;
 	const body: JsonObject = { model: options.model.id, input: options.input };
@@ -248,7 +247,7 @@ function compactUsage(model: Model<any>, result: JsonObject): Usage | undefined 
 		totalTokens: readNumber(usage.total_tokens),
 		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 	};
-	try { calculateCost(model, mapped); } catch { /* Models without price metadata still retain token usage. */ }
+	try { calculateCost(model, mapped); } catch {}
 	return mapped;
 }
 
@@ -443,9 +442,6 @@ async function nativeAndPortableCompaction(
 		env: auth.env,
 		signal: event.signal,
 	});
-	// Generate the same meaningful text summary Pi would have persisted without
-	// the native adapter. This is deliberate extra work: it keeps model/provider
-	// switches and sessions loaded without this extension usable.
 	const portable = await compact(
 		event.preparation,
 		model,
@@ -489,7 +485,6 @@ export default function (pi: ExtensionAPI): void {
 		const model = ctx.model;
 		if (!supportsNativeCompaction(model)) return;
 		const branch = ctx.sessionManager.getBranch();
-		// Avoid auth resolution on ordinary requests that have no native checkpoint.
 		const candidate = findLatestNativeCompaction(branch, model);
 		if (!candidate || genericCompactionSelected(pi, ctx)) return;
 		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);

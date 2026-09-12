@@ -165,7 +165,7 @@ describe("standalone Responses bridge", () => {
 					}),
 					{ status: 200, headers: { "content-type": "application/json" } },
 				);
-			}) as typeof fetch,
+			}) as unknown as typeof fetch,
 		});
 
 		expect(sentPayload.input).toEqual([{ type: "message", role: "user", content: "native-history" }]);
@@ -227,7 +227,7 @@ describe("Codex Remote V2 bridge", () => {
 					status: 200,
 					headers: { "content-type": "text/event-stream" },
 				});
-			}) as typeof fetch,
+			}) as unknown as typeof fetch,
 		});
 
 		expect(prepared.input.at(-1)).toEqual({ type: "compaction_trigger" });
