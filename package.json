@@ -1,5 +1,5 @@
 {
-  "name": "pi-provider-compaction",
+  "name": "@nijaru/pi-provider-compaction",
   "version": "0.0.1",
   "type": "module",
   "description": "Provider-native context compaction adapters for Pi",
@@ -12,6 +12,10 @@
     "responses"
   ],
   "license": "MIT",
+
+  "publishConfig": {
+    "access": "public"
+  },
   "author": "Nick Naru <nick@nijaru.com>",
   "repository": {
     "type": "git",

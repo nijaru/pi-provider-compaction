@@ -57,7 +57,7 @@ Pi 0.85.1 exposes a pre-request rewrite hook but no extension hook that receives
 ## Installation
 
 ```bash
-pi install git:github.com/nijaru/pi-provider-compaction
+pi install npm:@nijaru/pi-provider-compaction
 ```
 
 Install [pi-compactor](https://github.com/nijaru/pi-compactor) separately for model-directed timing/context hints.
