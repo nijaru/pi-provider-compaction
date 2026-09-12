@@ -2,15 +2,9 @@
 
 Provider-native context compaction for [Pi](https://github.com/earendil-works/pi).
 
-This is a companion to [pi-compactor](https://github.com/nijaru/pi-compactor):
-
-- **pi-compactor** owns when compaction should happen and how the agent resumes.
-- **pi-provider-compaction** owns how a provider's native compaction protocol works.
-
-Provider-native compaction is not just a cheaper summary-model call. It may require
-provider-specific request formats, opaque compaction state, session persistence, and
-replaying that state on later requests. Keeping those concerns here prevents them
-from becoming policy and lifecycle logic in `pi-compactor`.
+[pi-compactor](https://github.com/nijaru/pi-compactor) owns when to compact and
+how the agent resumes. This extension owns provider protocols, persisted native
+state, and replay. It does not own Fast mode or quota display.
 
 ## Installation
 
@@ -18,81 +12,100 @@ from becoming policy and lifecycle logic in `pi-compactor`.
 pi install git:github.com/nijaru/pi-provider-compaction
 ```
 
-Install [`pi-compactor`](https://github.com/nijaru/pi-compactor) separately if you
-also want its model-driven `compact` tool and context-usage hints.
+Install `pi-compactor` separately for its model-directed `compact` tool and
+context-usage hints.
 
-## OpenAI Responses
+## Current route support
 
-The initial adapter supports the official OpenAI provider's `openai-responses`
-API. During Pi compaction it calls the provider's stateless `/responses/compact`
-endpoint, persists the returned opaque compaction item in the session, and
-replays the canonical compacted window on later requests.
+Selection uses the Pi provider ID and API adapter, not the model's display name
+or whether Pi is running in a terminal or an editor.
 
-The adapter leaves unsupported APIs on Pi's normal compaction path.
+| Pi provider | Model API | This extension's behavior |
+| --- | --- | --- |
+| `openai` | `openai-responses` | Attempts standalone `/responses/compact`; failures leave compaction to Pi. |
+| `openai-codex` | `openai-codex-responses` | No native adapter here; leaves compaction to Pi or another explicitly configured handler. |
+| DeepSeek, OpenRouter, Azure, or another provider | Any | No native adapter here. |
 
-### Generic compaction-model precedence
+The current eligibility check is exactly
+`model.provider === "openai" && model.api === "openai-responses"`.
+A GPT model accessed through `openai-codex` is therefore different from the
+same model accessed through direct `openai`. Pi can run either route; using Pi
+does not select one automatically. Backend support and valid authentication
+are still required for an eligible request to succeed.
 
-[pi-compactor](https://github.com/nijaru/pi-compactor) can run a generic model of
-your choice for compaction summaries. When one is configured, it takes
-precedence over provider-native compaction — this extension makes no native
-compaction request and replays no previously persisted native window. The same
-resolution order as pi-compactor applies:
+For direct OpenAI, the extension sends a compact request using the registry's
+resolved credentials and base URL, persists the complete returned window, and
+replays it on later compatible requests. OpenAI documents that the returned
+window is canonical and must not be pruned; it can contain retained items as
+well as the opaque compaction item. See the
+[compaction guide](https://developers.openai.com/api/docs/guides/compaction).
 
-1. the `--compaction-model` flag (provided by pi-compactor, which must be
-   installed to use it; this extension reads the shared CLI value from
-   `process.argv` without re-registering it, since Pi rejects duplicate
-   flag registrations; Pi populates flag values from CLI args, so this
-   observes every flag source the host supports),
-2. a trusted project's `.pi/compaction-policy.json` (`models` list), then
-3. the agent directory's `compaction-policy.json`.
+## Generic compaction-model precedence
 
-A policy file with an empty `models` list is an explicit choice to use no generic
-model, so native compaction runs. Leave the flag unset and no policy file present
-to use native compaction.
+A generic summary model configured for `pi-compactor` takes precedence. This
+extension makes no native request and replays no saved native window while
+that policy is selected. Resolution order:
 
-### Session and cost behavior
+1. `--compaction-model`, registered by `pi-compactor`;
+2. a trusted project's `.pi/compaction-policy.json` `models` list;
+3. the agent directory's `compaction-policy.json` `models` list.
 
-The provider's compacted output is opaque and is not shown as a human-readable
-summary. Pi's normal session entries remain available for transcript navigation;
-the native window is used only for subsequent provider requests.
+An empty `models` list explicitly selects no generic model. Leave the flag
+unset and no policy file present to use native compaction on an eligible route.
 
-The compaction pass's token usage and cost are recorded on the compaction entry
-like any other compaction, so quota and cost extensions see them.
+## Session portability limitation
 
-Pi estimates post-compaction context size from the kept session entries. A native
-window is usually smaller than that estimate, so Pi's threshold may trigger the
-next compaction slightly earlier than strictly necessary.
+**Successful native compaction currently saves a placeholder as Pi's visible
+summary, not a portable text summary.** The useful compacted state lives in
+extension-owned details. Replay requires the same provider, API, and model ID.
 
-### Why not server-side compaction?
+Switching to DeepSeek, Codex, another model, disabling this extension, or
+selecting a generic compaction policy can therefore leave only that placeholder
+and Pi's retained recent messages in the active context. The original session
+history remains on disk; it is not automatically restored or summarized for the
+new route. A fallback after a failed compact request does not solve portability
+after a successful native compact.
 
-OpenAI also offers server-side compaction (`context_management.compact_threshold` on
-the create request). This adapter deliberately uses the standalone endpoint
-instead, and re-evaluates when Pi can carry the server-side mode:
+Before switching an important native-compacted session, preserve the needed
+state while the compatible route is still active, or branch from the original
+history before the compaction boundary. Do not assume an export or a model
+switch makes the encrypted checkpoint usable by another provider.
 
-- Both modes run the same compaction machinery and return the same opaque
-  encrypted item, so there is no summary-quality difference between them.
-- The server-side win is uninterrupted turns at the context limit (Pi currently
-  aborts, compacts, and retries). That requires Pi to persist an
-  externally-driven compaction into its session, which no Pi release does yet.
-- Pi is stateless (`store: false`) and rebuilds the input window from session
-  entries on every request. Until Pi surfaces in-stream compaction items, a
-  server-side compaction would run on nearly every turn over a near-full
-  window and Pi could not reuse the result — strictly more expensive than one
-  compact pass per window-fill.
+Portable continuation and a separate Codex adapter are the next integration
+priorities. They require runtime and authenticated-provider tests; this support
+table does not claim they are implemented.
 
-When Pi adds in-stream compaction support, only this adapter's request half
-changes; the persisted-state replay below it stays as is.
+## Cost and lifecycle
+
+Compaction usage and cost are recorded on the compaction entry when returned by
+the provider. Pi's context estimate can differ from the actual replayed window;
+validate thresholds against the installed runtime rather than assuming that a
+native checkpoint is always smaller or higher quality.
+
+This implementation uses the standalone compact endpoint. OpenAI also offers
+in-stream compaction, including stateless operation. Adopting it requires Pi to
+capture, persist, and replay the returned items through its session lifecycle;
+adding a request field alone is insufficient. Do not change `store` behavior or
+replace the provider transport merely to add compaction support.
+
+## Development
+
+```bash
+bun install
+bun run check
+```
+
+Offline tests are not evidence of live endpoint compatibility. Test compaction,
+resume, model switching, and coexistence with `pi-compactor` on the installed Pi
+runtime before changing a working session.
 
 ## Related extensions
 
-This remains separate from:
+Keep these responsibilities independently installable:
 
-- [`pi-compactor`](https://github.com/nijaru/pi-compactor), for model-driven compaction policy;
-- [`pi-fast-mode`](https://github.com/nijaru/pi-fast-mode), for provider request service tiers; and
-- [`pi-usage`](https://github.com/nijaru/pi-usage), for provider quota display.
-
-Those extensions have useful independent responsibilities and remain
-independently installable.
+- [pi-compactor](https://github.com/nijaru/pi-compactor): timing and resumption.
+- [pi-fast-mode](https://github.com/nijaru/pi-fast-mode): request service tiers.
+- [pi-usage](https://github.com/nijaru/pi-usage): quota display, not request policy.
 
 ## License
 
