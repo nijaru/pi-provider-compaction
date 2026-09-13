@@ -4,11 +4,9 @@
   "workspaces": {
     "": {
       "name": "pi-provider-compaction",
-      "dependencies": {
-        "@earendil-works/pi-ai": "0.85.1",
-      },
       "devDependencies": {
         "@earendil-works/pi-agent-core": "0.85.1",
+        "@earendil-works/pi-ai": "0.85.1",
         "@earendil-works/pi-coding-agent": "0.85.1",
         "@types/bun": "latest",
         "oxlint": "^1.81.0",

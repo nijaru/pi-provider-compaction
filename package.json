@@ -1,6 +1,6 @@
 {
   "name": "@nijaru/pi-provider-compaction",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "type": "module",
   "description": "Provider-native context compaction adapters for Pi",
   "keywords": [
@@ -23,26 +23,27 @@
   },
   "pi": {
     "extensions": [
-      "./index.ts"
+      "./dist/index.js"
     ]
   },
   "scripts": {
+    "build": "bun run build.ts",
+    "prepack": "bun run build",
     "test": "bun test",
-    "lint": "oxlint index.ts protocol.ts policy.ts tests/",
+    "lint": "oxlint build.ts index.ts protocol.ts policy.ts tests/",
     "typecheck": "tsc --noEmit",
-    "check": "bun test && oxlint index.ts protocol.ts policy.ts tests/ && tsc --noEmit"
+    "check": "bun test && oxlint build.ts index.ts protocol.ts policy.ts tests/ && tsc --noEmit"
   },
   "files": [
+    "dist",
     "index.ts",
     "protocol.ts",
     "policy.ts",
     "README.md",
     "LICENSE"
   ],
-  "dependencies": {
-    "@earendil-works/pi-ai": "0.85.1"
-  },
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.85.1",
     "@earendil-works/pi-agent-core": "0.85.1",
     "@earendil-works/pi-coding-agent": "0.85.1",
     "@types/bun": "latest",

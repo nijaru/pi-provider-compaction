@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["bun"]
   },
-  "include": ["index.ts", "protocol.ts", "policy.ts", "tests/**/*.ts"]
+  "include": ["build.ts", "index.ts", "protocol.ts", "policy.ts", "tests/**/*.ts"]
 }
