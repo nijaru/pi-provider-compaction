@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
+import { getCurrentSystemPrompt, getCurrentTools, normalizeContext } from "@earendil-works/pi-ai";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
+import extension from "../index";
 import {
 	NATIVE_COMPACTION_SUMMARY,
 	NATIVE_COMPACTION_TYPE,
@@ -147,7 +149,7 @@ describe("standalone Responses bridge", () => {
 		const result = await requestProviderCompaction({
 			provider,
 			model: azureModel,
-			context: { systemPrompt: "system", messages: [], tools: [] },
+			context: normalizeContext({ systemPrompt: "system", messages: [], tools: [] }),
 			protocol: "responses-compact",
 			input: [{ type: "message", role: "user", content: "native-history" }],
 			apiKey: "secret",
@@ -213,7 +215,7 @@ describe("Codex Remote V2 bridge", () => {
 		const result = await requestProviderCompaction({
 			provider,
 			model: codexModel,
-			context: { systemPrompt: "system", messages: [], tools: [] },
+			context: normalizeContext({ systemPrompt: "system", messages: [], tools: [] }),
 			protocol: "remote-v2",
 			input: [user, { type: "message", role: "assistant", content: [] }],
 			apiKey: "oauth",
@@ -311,5 +313,62 @@ describe("legacy direct helper", () => {
 		expect(result.nativeUsage?.cacheWrite).toBe(25);
 		expect(result.nativeUsage?.reasoning).toBe(64);
 		expect(result.usage).toEqual(result.nativeUsage);
+	});
+});
+
+describe("extension dispatch context", () => {
+	// Pi 0.86+ providers read the prompt and tool declarations from the transcript's
+	// system messages, not from `Context.systemPrompt`/`Context.tools`. Dispatching an
+	// un-normalized `Context` silently dropped both.
+	test("normalizes the request context so providers recover the prompt and tools", async () => {
+		const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+		const pi = {
+			on(name: string, handler: (event: any, ctx: any) => unknown) {
+				handlers.set(name, handler);
+				return () => {};
+			},
+			getFlag: () => undefined,
+			getAllTools: () => [{ name: "read", description: "Read a file", parameters: {} }],
+			getActiveTools: () => ["read"],
+		};
+		(extension as any)(pi);
+
+		const captured: any[] = [];
+		const provider = {
+			stream(_model: any, context: any) {
+				captured.push(context);
+				throw new Error("captured dispatch context");
+			},
+		};
+		const ctx = {
+			cwd: "/tmp",
+			isProjectTrusted: () => false,
+			model: directModel,
+			thinkingLevel: undefined,
+			getSystemPrompt: () => "SYSTEM PROMPT",
+			sessionManager: {
+				buildContextEntries: () => [],
+				getSessionId: () => "session-1",
+			},
+			modelRegistry: {
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "secret", headers: {}, env: {} }),
+				getProvider: () => provider,
+			},
+		};
+
+		const handler = handlers.get("session_before_compact");
+		expect(handler).toBeDefined();
+		await handler!({
+			preparation: {},
+			branchEntries: [],
+			customInstructions: undefined,
+			signal: new AbortController().signal,
+		}, ctx);
+
+		expect(captured).toHaveLength(1);
+		const messages = captured[0].messages as Array<{ role: string }>;
+		expect(messages[0]?.role).toBe("system");
+		expect(getCurrentSystemPrompt(messages)).toContain("SYSTEM PROMPT");
+		expect(getCurrentTools(messages).map((tool) => tool.name)).toEqual(["read"]);
 	});
 });

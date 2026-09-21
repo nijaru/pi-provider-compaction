@@ -1,9 +1,9 @@
 import type {
 	AssistantMessageEventStream,
-	Context,
 	Model,
 	Provider,
 	ProviderHeaders,
+	TranscriptContext,
 	Usage,
 } from "@earendil-works/pi-ai";
 
@@ -193,7 +193,7 @@ async function collectProviderUsage(stream: AssistantMessageEventStream, signal:
 interface TransportRequest {
 	provider: Provider;
 	model: Model<any>;
-	context: Context;
+	context: TranscriptContext;
 	input: ResponseItem[];
 	apiKey?: string;
 	headers?: ProviderHeaders;

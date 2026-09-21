@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
-import { calculateCost } from "@earendil-works/pi-ai";
-import type { Context, Model, Tool, Usage } from "@earendil-works/pi-ai";
+import { calculateCost, normalizeContext } from "@earendil-works/pi-ai";
+import type { Model, Tool, TranscriptContext, Usage } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -152,7 +152,7 @@ export function findLatestNativeCompaction(
 function responseItemsFromMessages(model: Model<any>, messages: AgentMessage[]): ResponseItem[] {
 	const input = convertResponsesMessages(
 		model,
-		{ messages: convertToLlm(messages), tools: [] },
+		normalizeContext({ messages: convertToLlm(messages), tools: [] }),
 		TOOL_CALL_PROVIDERS,
 		{ includeSystemPrompt: false },
 	);
@@ -379,13 +379,15 @@ function activeTools(pi: ExtensionAPI): Tool[] {
 	});
 }
 
-function providerContext(pi: ExtensionAPI, ctx: ExtensionContext, activeEntries: readonly SessionEntry[]): Context {
+function providerContext(pi: ExtensionAPI, ctx: ExtensionContext, activeEntries: readonly SessionEntry[]): TranscriptContext {
 	const messages = activeEntries.flatMap((entry) => sessionEntryToContextMessages(entry));
-	return {
+	// Providers read the prompt and tool declarations from the transcript's system
+	// messages, so fold the raw request context before dispatching to one.
+	return normalizeContext({
 		systemPrompt: ctx.getSystemPrompt(),
 		messages: convertToLlm(messages),
 		tools: activeTools(pi),
-	};
+	});
 }
 
 function cleanHeaders(headers: Record<string, string | null> | undefined): Record<string, string> | undefined {
