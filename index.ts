@@ -395,11 +395,6 @@ function providerContext(pi: ExtensionAPI, ctx: ExtensionContext, messages: Agen
 	});
 }
 
-function cleanHeaders(headers: Record<string, string | null> | undefined): Record<string, string> | undefined {
-	if (!headers) return undefined;
-	return Object.fromEntries(Object.entries(headers).filter((entry): entry is [string, string] => entry[1] !== null));
-}
-
 function combineUsage(first: Usage | undefined, second: Usage | undefined): Usage | undefined {
 	if (!first) return second;
 	if (!second) return first;
@@ -455,7 +450,9 @@ async function nativeAndPortableCompaction(
 		event.preparation,
 		requestModel,
 		auth.apiKey,
-		cleanHeaders(auth.headers),
+		// `compact` narrows headers to strings, but Pi's provider pipeline reads the
+		// same record and treats `null` as a deletion.
+		auth.headers as Record<string, string> | undefined,
 		event.customInstructions,
 		event.signal,
 		ctx.thinkingLevel,

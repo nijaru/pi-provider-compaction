@@ -505,3 +505,96 @@ describe("canonical projection and payload ownership", () => {
 		expect(result.instructions).toBe("BASE_SYSTEM_PROMPT");
 	});
 });
+
+describe("portable summarization headers", () => {
+	test("keeps null header deletions for the summary request", async () => {
+		let portableOptions: any;
+		const provider = {
+			stream(_model: any, _context: any, options: any) {
+				return asyncStream(async () => {
+					const prepared = await options.onPayload({ model: "gpt-test", input: [] });
+					const response = await options.fetch("https://api.openai.com/v1/responses", {
+						method: "POST",
+						headers: {},
+						body: JSON.stringify(prepared),
+					});
+					await response.text();
+				});
+			},
+			// The portable summary call reaches the provider through `compact`.
+			streamSimple(_model: any, _context: any, options: any) {
+				portableOptions = options;
+				return {
+					result: async () => ({
+						role: "assistant",
+						content: [{ type: "text", text: "summary" }],
+						api: "openai-responses",
+						provider: "openai",
+						model: "gpt-test",
+						usage,
+						stopReason: "stop",
+						timestamp: Date.now(),
+					}),
+				};
+			},
+		} as any;
+
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async () => new Response(JSON.stringify({
+			id: "resp-1",
+			output: [{ type: "message", role: "user", content: [] }, checkpoint],
+			usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 },
+		}), { status: 200, headers: { "content-type": "application/json" } })) as unknown as typeof fetch;
+
+		try {
+			const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+			const api = {
+				on(name: string, handler: (event: any, ctx: any) => unknown) {
+					handlers.set(name, handler);
+					return () => {};
+				},
+				getFlag: () => undefined,
+				getAllTools: () => [],
+				getActiveTools: () => [],
+			};
+			(extension as any)(api);
+
+			const ctx = {
+				cwd: "/tmp",
+				isProjectTrusted: () => false,
+				model: directModel,
+				thinkingLevel: undefined,
+				getSystemPrompt: () => "SYSTEM",
+				sessionManager: {
+					buildSessionProjection: () => ({ entries: [], messages: [], thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
+					getBranch: () => [],
+					getSessionId: () => "session-1",
+				},
+				modelRegistry: {
+					getApiKeyAndHeaders: async () => ({ ok: true as const, apiKey: "secret", headers: { "x-test": "value", "x-delete": null }, env: {} }),
+					getProvider: () => provider,
+				},
+			};
+
+			await handlers.get("session_before_compact")!({
+				preparation: {
+					firstKeptEntryId: "keep",
+					messagesToSummarize: [{ role: "user", content: "old", timestamp: Date.now() }],
+					turnPrefixMessages: [],
+					isSplitTurn: false,
+					tokensBefore: 100,
+					fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+					settings: { enabled: true, reserveTokens: 1000, keepRecentTokens: 100 },
+				},
+				branchEntries: [],
+				customInstructions: "preserve",
+				signal: new AbortController().signal,
+			}, ctx);
+
+			// `null` deletes a provider default header; stripping it would restore it.
+			expect(portableOptions?.headers).toEqual({ "x-test": "value", "x-delete": null });
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+	});
+});
