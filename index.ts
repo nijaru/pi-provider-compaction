@@ -11,7 +11,6 @@ import type {
 import {
 	compact,
 	convertToLlm,
-	sessionEntryToContextMessages,
 } from "@earendil-works/pi-coding-agent";
 import { resolveCompactionModelPolicy } from "./policy";
 import {
@@ -126,8 +125,10 @@ export function readNativeCompactionDetails(value: unknown): NativeCompactionDet
 }
 
 function identityEqual(left: NativeIdentity | undefined, right: NativeIdentity | undefined): boolean {
-	if (!left) return true;
-	if (!right) return false;
+	// A missing stored identity (legacy v1) matches any route; a missing query
+	// identity means "do not filter", which is how the replay pre-check asks for
+	// the latest native compaction before resolving the current route identity.
+	if (!left || !right) return true;
 	return left.endpoint === right.endpoint && left.organization === right.organization && left.project === right.project && left.accountId === right.accountId && left.azureApiVersion === right.azureApiVersion && left.azureDeployment === right.azureDeployment;
 }
 
@@ -159,23 +160,28 @@ function responseItemsFromMessages(model: Model<any>, messages: AgentMessage[]):
 	return input.filter(isObject) as unknown as ResponseItem[];
 }
 
-function responseItemsFromEntries(model: Model<any>, entries: readonly SessionEntry[]): ResponseItem[] {
-	return responseItemsFromMessages(model, entries.flatMap((entry) => sessionEntryToContextMessages(entry)));
+/** Model-visible entries from Pi's canonical projection, with source provenance. */
+type ProjectedEntries = readonly { sourceEntry: SessionEntry; messages: AgentMessage[] }[];
+
+function projectedResponseItems(model: Model<any>, entries: ProjectedEntries): ResponseItem[] {
+	return responseItemsFromMessages(model, entries.flatMap((entry) => entry.messages));
 }
 
 function nativeRequestInput(
 	model: Model<any>,
-	branchEntries: readonly SessionEntry[],
-	activeEntries: readonly SessionEntry[],
+	projected: ProjectedEntries,
 	previous: NativeCompactionState | undefined,
 ): ResponseItem[] {
 	if (previous) {
-		const previousIndex = branchEntries.findIndex((entry) => entry.id === previous.entryId);
+		const previousIndex = projected.findIndex((entry) => entry.sourceEntry.id === previous.entryId);
 		if (previousIndex >= 0) {
-			return [...structuredClone(previous.output), ...responseItemsFromEntries(model, branchEntries.slice(previousIndex + 1))];
+			return [...structuredClone(previous.output), ...projectedResponseItems(model, projected.slice(previousIndex + 1))];
 		}
 	}
-	return responseItemsFromEntries(model, activeEntries);
+	// `buildSessionProjection()` is the canonical edited projection: it applies
+	// context_edit omissions and replacements that raw session entries still carry,
+	// so a native compaction cannot resurrect context Pi no longer sends.
+	return projectedResponseItems(model, projected);
 }
 
 function authHeaders(apiKey: string | undefined, headers: Record<string, string | null> | undefined): Record<string, string> {
@@ -379,8 +385,7 @@ function activeTools(pi: ExtensionAPI): Tool[] {
 	});
 }
 
-function providerContext(pi: ExtensionAPI, ctx: ExtensionContext, activeEntries: readonly SessionEntry[]): TranscriptContext {
-	const messages = activeEntries.flatMap((entry) => sessionEntryToContextMessages(entry));
+function providerContext(pi: ExtensionAPI, ctx: ExtensionContext, messages: AgentMessage[]): TranscriptContext {
 	// Providers read the prompt and tool declarations from the transcript's system
 	// messages, so fold the raw request context before dispatching to one.
 	return normalizeContext({
@@ -429,14 +434,16 @@ async function nativeAndPortableCompaction(
 	const provider = ctx.modelRegistry.getProvider(model.provider);
 	if (!provider) return undefined;
 	const identity = routeIdentity(model, auth);
-	const branchEntries = event.branchEntries;
-	const activeEntries = ctx.sessionManager.buildContextEntries();
-	const previous = findLatestNativeCompaction(branchEntries, model, identity);
-	const input = nativeRequestInput(model, branchEntries, activeEntries, previous);
+	// Apply the auth-resolved endpoint the way `ModelRegistry.stream()` would; raw
+	// provider dispatch otherwise ignores a provider-owned base URL override.
+	const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
+	const projection = ctx.sessionManager.buildSessionProjection();
+	const previous = findLatestNativeCompaction(event.branchEntries, model, identity);
+	const input = nativeRequestInput(model, projection.entries, previous);
 	const native = await requestProviderCompaction({
 		provider,
-		model,
-		context: providerContext(pi, ctx, activeEntries),
+		model: requestModel,
+		context: providerContext(pi, ctx, projection.messages),
 		input,
 		protocol,
 		apiKey: auth.apiKey,
@@ -446,7 +453,7 @@ async function nativeAndPortableCompaction(
 	});
 	const portable = await compact(
 		event.preparation,
-		model,
+		requestModel,
 		auth.apiKey,
 		cleanHeaders(auth.headers),
 		event.customInstructions,
@@ -493,10 +500,15 @@ export default function (pi: ExtensionAPI): void {
 		if (!auth.ok) return;
 		const latest = findLatestNativeCompaction(branch, model, routeIdentity(model, auth));
 		if (!latest) return;
-		const index = branch.findIndex((entry: SessionEntry) => entry.id === latest.entryId);
-		const postItems = index >= 0 ? responseItemsFromEntries(model, branch.slice(index + 1)) : [];
+		const projection = ctx.sessionManager.buildSessionProjection();
+		const index = projection.entries.findIndex((entry) => entry.sourceEntry.id === latest.entryId);
+		const postItems = index >= 0 ? projectedResponseItems(model, projection.entries.slice(index + 1)) : [];
 		const rewritten = rewriteResponsesPayload(event.payload, latest, postItems);
 		if (rewritten === event.payload || !isObject(rewritten)) return rewritten;
+		// The provider already serialized the effective prompt, including any
+		// `context_with_system` transformation. Only supply one when the payload has none;
+		// `ctx.getSystemPrompt()` is not the final serialized request prompt.
+		if (typeof rewritten.instructions === "string" && rewritten.instructions.length > 0) return rewritten;
 		const systemPrompt = ctx.getSystemPrompt();
 		return systemPrompt ? { ...rewritten, instructions: systemPrompt } : rewritten;
 	});

@@ -347,6 +347,7 @@ describe("extension dispatch context", () => {
 			thinkingLevel: undefined,
 			getSystemPrompt: () => "SYSTEM PROMPT",
 			sessionManager: {
+				buildSessionProjection: () => ({ entries: [], messages: [], thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
 				buildContextEntries: () => [],
 				getSessionId: () => "session-1",
 			},
@@ -370,5 +371,137 @@ describe("extension dispatch context", () => {
 		expect(messages[0]?.role).toBe("system");
 		expect(getCurrentSystemPrompt(messages)).toContain("SYSTEM PROMPT");
 		expect(getCurrentTools(messages).map((tool) => tool.name)).toEqual(["read"]);
+	});
+});
+
+describe("canonical projection and payload ownership", () => {
+	function makePi() {
+		const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+		return {
+			handlers,
+			api: {
+				on(name: string, handler: (event: any, ctx: any) => unknown) {
+					handlers.set(name, handler);
+					return () => {};
+				},
+				getFlag: () => undefined,
+				getAllTools: () => [{ name: "read", description: "Read a file", parameters: {} }],
+				getActiveTools: () => ["read"],
+			},
+		};
+	}
+
+	function projectionContext(entries: any[], messages: any[], overrides: any = {}) {
+		return {
+			cwd: "/tmp",
+			isProjectTrusted: () => false,
+			model: directModel,
+			thinkingLevel: undefined,
+			getSystemPrompt: () => "BASE_SYSTEM_PROMPT",
+			sessionManager: {
+				buildSessionProjection: () => ({ entries, messages, thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
+				// Raw context keeps the omitted message so the test fails if this is used.
+				buildContextEntries: () => entries.map((entry: any) => entry.sourceEntry),
+				getBranch: () => entries.map((entry: any) => entry.sourceEntry),
+				getSessionId: () => "session-1",
+			},
+			modelRegistry: {
+				getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "secret", headers: {}, env: {} }),
+				getProvider: () => overrides.provider,
+			},
+		};
+	}
+
+	test("native request input applies context_edit omissions instead of raw entries", async () => {
+		const keptMessage = { role: "user", content: [{ type: "text", text: "KEPT_CONTENT" }], timestamp: 1 };
+		const omittedMessage = { role: "assistant", content: [{ type: "text", text: "OMITTED_SHOULD_NOT_BE_SENT" }], timestamp: 2 };
+		const keptEntry = { type: "message", id: "m1", parentId: null, timestamp: "t1", message: keptMessage } as SessionEntry;
+		const omittedEntry = { type: "message", id: "m2", parentId: "m1", timestamp: "t2", message: omittedMessage } as SessionEntry;
+		const editEntry = { type: "context_edit", id: "e1", parentId: "m2", timestamp: "t3", targetId: "m2", replacement: null } as SessionEntry;
+
+		let sentPayload: any;
+		const provider = {
+			stream(_model: any, _context: any, options: any) {
+				return {
+					[Symbol.asyncIterator]() {
+						return {
+							async next() {
+								sentPayload = await options.onPayload({ model: "gpt-test", input: [{ type: "message", role: "user", content: "provider-built" }] });
+								throw new Error("stop after capture");
+							},
+						};
+					},
+				};
+			},
+		} as any;
+
+		const { handlers, api } = makePi();
+		(extension as any)(api);
+		const ctx = projectionContext(
+			[
+				{ sourceEntry: keptEntry, messages: [keptMessage] },
+				{ sourceEntry: omittedEntry, messages: [] },
+				{ sourceEntry: editEntry, messages: [] },
+			],
+			[keptMessage],
+			{ provider },
+		);
+
+		await handlers.get("session_before_compact")!(
+			{ preparation: {}, branchEntries: [keptEntry, omittedEntry, editEntry], customInstructions: undefined, signal: new AbortController().signal },
+			ctx,
+		);
+
+		const serialized = JSON.stringify(sentPayload.input);
+		expect(serialized).toContain("KEPT_CONTENT");
+		expect(serialized).not.toContain("OMITTED_SHOULD_NOT_BE_SENT");
+	});
+
+	test("replay does not overwrite a payload's serialized instructions", async () => {
+		const keptMessage = { role: "user", content: [{ type: "text", text: "KEPT_CONTENT" }], timestamp: 1 };
+		const keptEntry = { type: "message", id: "m1", parentId: "c1", timestamp: "t2", message: keptMessage } as SessionEntry;
+		const native = compactionEntry(details({ output: [checkpoint, { type: "message", role: "assistant", content: [] }] }));
+
+		// `before_provider_request` rewrites the payload and never dispatches a stream.
+		const provider = {} as any;
+		const { handlers, api } = makePi();
+		(extension as any)(api);
+		const ctx = {
+			...projectionContext([{ sourceEntry: keptEntry, messages: [keptMessage] }], [keptMessage], { provider }),
+			model: directModel,
+			sessionManager: {
+				...projectionContext([], [], { provider }).sessionManager,
+				getBranch: () => [native, keptEntry],
+				buildSessionProjection: () => ({ entries: [{ sourceEntry: keptEntry, messages: [keptMessage] }], messages: [keptMessage], thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
+			},
+		};
+
+		const payload = { model: "gpt-test", instructions: "PER_REQUEST_OVERRIDE", input: [{ type: "message", role: "user", content: "kept" }] };
+		const result: any = await handlers.get("before_provider_request")!({ type: "before_provider_request", payload }, ctx);
+		expect(result.instructions).toBe("PER_REQUEST_OVERRIDE");
+	});
+
+	test("replay supplies the system prompt only when the payload has none", async () => {
+		const keptMessage = { role: "user", content: [{ type: "text", text: "KEPT_CONTENT" }], timestamp: 1 };
+		const keptEntry = { type: "message", id: "m1", parentId: "c1", timestamp: "t2", message: keptMessage } as SessionEntry;
+		const native = compactionEntry(details({ output: [checkpoint, { type: "message", role: "assistant", content: [] }] }));
+
+		// `before_provider_request` rewrites the payload and never dispatches a stream.
+		const provider = {} as any;
+		const { handlers, api } = makePi();
+		(extension as any)(api);
+		const base = projectionContext([{ sourceEntry: keptEntry, messages: [keptMessage] }], [keptMessage], { provider });
+		const ctx = {
+			...base,
+			sessionManager: {
+				...base.sessionManager,
+				getBranch: () => [native, keptEntry],
+				buildSessionProjection: () => ({ entries: [{ sourceEntry: keptEntry, messages: [keptMessage] }], messages: [keptMessage], thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
+			},
+		};
+
+		const payload = { model: "gpt-test", input: [{ type: "message", role: "user", content: "kept" }] };
+		const result: any = await handlers.get("before_provider_request")!({ type: "before_provider_request", payload }, ctx);
+		expect(result.instructions).toBe("BASE_SYSTEM_PROMPT");
 	});
 });
