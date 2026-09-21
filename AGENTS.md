@@ -21,4 +21,4 @@ Provider-native compaction adapters for Pi.
 
 ## Development
 
-Use Bun/TypeScript and Pi 0.85.1-compatible public APIs. `index.ts` owns session integration/replay, `protocol.ts` owns provider transport and validation, and `policy.ts` mirrors `pi-compactor`'s optional generic-model precedence. Run `bun run check` and `git diff --check`; authenticated endpoint checks must be reported separately from fixture coverage.
+Use Bun/TypeScript and Pi 0.87.0-compatible public APIs (verified floor; dev dependencies pin 0.87.0 and `bun run check` is the compatibility gate). `index.ts` owns session integration/replay, `protocol.ts` owns provider transport and validation, and `policy.ts` mirrors `pi-compactor`'s optional generic-model precedence. Run `bun run check` and `git diff --check`; authenticated endpoint checks must be reported separately from fixture coverage.

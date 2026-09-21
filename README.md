@@ -52,7 +52,7 @@ Azure checkpoints additionally record the effective API version and selected dep
 
 OpenAI and Azure Responses can emit compaction items during an ordinary request through `context_management`. This extension does **not** enable that path yet.
 
-Pi 0.85.1 exposes a pre-request rewrite hook but no extension hook that receives the provider response body/stream. Adding `context_management` alone would let the server compact without giving the extension a reliable way to validate, persist, and replay the emitted checkpoint. Standalone compaction and Codex Remote V2 are therefore implemented now; in-stream compaction requires a Pi host response/checkpoint hook or equivalent persisted provider metadata.
+Pi 0.87.0 exposes a pre-request rewrite hook but no extension hook that receives the provider response body/stream. Adding `context_management` alone would let the server compact without giving the extension a reliable way to validate, persist, and replay the emitted checkpoint. Standalone compaction and Codex Remote V2 are therefore implemented now; in-stream compaction requires a Pi host response/checkpoint hook or equivalent persisted provider metadata.
 
 ## Installation
 

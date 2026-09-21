@@ -1,6 +1,6 @@
 {
   "name": "@nijaru/pi-provider-compaction",
-  "version": "0.0.3",
+  "version": "0.0.4",
   "type": "module",
   "description": "Provider-native context compaction adapters for Pi",
   "keywords": [
@@ -12,7 +12,6 @@
     "responses"
   ],
   "license": "MIT",
-
   "publishConfig": {
     "access": "public"
   },
@@ -51,6 +50,6 @@
     "typescript": "^6.0.3"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.87.0"
+    "@earendil-works/pi-coding-agent": "*"
   }
 }
