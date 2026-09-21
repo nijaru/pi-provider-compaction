@@ -13,6 +13,7 @@ Provider-native compaction adapters for Pi.
 
 ## Protocol rules
 
+- Native request input and replay must follow Pi's canonical `buildSessionProjection()`, never raw entries. `context_edit` omissions and replacements are invisible to `buildContextEntries()` and `sessionEntryToContextMessages()`, so a raw rebuild resurrects context Pi no longer sends.
 - Use Pi's active provider transport to obtain the real request URL, authentication, deployment/version semantics, and provider request shape.
 - Standalone Responses compaction preserves the full canonical returned output window. Validate size and checkpoint structure; do not prune it.
 - Codex Remote V2 appends `compaction_trigger` through the provider payload hook and inspects the actual SSE response while letting Pi's provider consume the same response.
