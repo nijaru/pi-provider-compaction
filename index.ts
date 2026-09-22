@@ -150,12 +150,32 @@ export function findLatestNativeCompaction(
 	return undefined;
 }
 
+/**
+ * Mirrors the Responses adapter's `getCompat()` for `convertResponsesMessages`. Without
+ * these flags the reconstruction collapses mid-conversation system updates and drops
+ * tool-addition items, so replayed context would lose instructions or tools.
+ */
+function responsesConversionOptions(model: Model<any>): Parameters<typeof convertResponsesMessages>[3] {
+	const compat = (model as { compat?: Record<string, unknown> }).compat ?? {};
+	const flag = (key: string) => compat[key] === true;
+	return {
+		includeSystemPrompt: false,
+		supportsMidConvoSystemMessages: flag("supportsMidConvoSystemMessages"),
+		supportsAdditionalTools: flag("supportsAdditionalTools"),
+		supportsToolSearch: flag("supportsToolSearch"),
+		toolOptions: {
+			supportsStrictMode: flag("supportsStrictMode"),
+			supportsOpenAIGrammarTools: flag("supportsOpenAIGrammarTools"),
+		},
+	};
+}
+
 function responseItemsFromMessages(model: Model<any>, messages: AgentMessage[]): ResponseItem[] {
 	const input = convertResponsesMessages(
 		model,
 		normalizeContext({ messages: convertToLlm(messages), tools: [] }),
 		TOOL_CALL_PROVIDERS,
-		{ includeSystemPrompt: false },
+		responsesConversionOptions(model),
 	);
 	return input.filter(isObject) as unknown as ResponseItem[];
 }
@@ -173,9 +193,20 @@ function idsAfter(branch: readonly SessionEntry[], entryId: string): ReadonlySet
 	return index >= 0 ? new Set(branch.slice(index + 1).map((entry) => entry.id)) : undefined;
 }
 
-/** Projected (context_edit-applied) messages for entries chronologically after the boundary. */
-function projectedAfter(model: Model<any>, entries: ProjectedEntries, afterIds: ReadonlySet<string>): ResponseItem[] {
-	return projectedResponseItems(model, entries.filter((entry) => afterIds.has(entry.sourceEntry.id)));
+function leadingSystemMessage(messages: readonly AgentMessage[]): AgentMessage | undefined {
+	return messages.length > 0 && messages[0]?.role === "system" ? messages[0] : undefined;
+}
+
+/**
+ * Projected (context_edit-applied) messages for entries chronologically after the boundary.
+ * The projection's leading system message is prepended so that a system update landing at the
+ * start of the slice is serialized as a mid-conversation update instead of the leading prompt
+ * (which `includeSystemPrompt: false` would then drop).
+ */
+function projectedAfter(model: Model<any>, entries: ProjectedEntries, afterIds: ReadonlySet<string>, leading: AgentMessage | undefined): ResponseItem[] {
+	const messages = entries.filter((entry) => afterIds.has(entry.sourceEntry.id)).flatMap((entry) => entry.messages);
+	const prefixed = leading !== undefined && messages[0]?.role === "system" ? [leading, ...messages] : messages;
+	return responseItemsFromMessages(model, prefixed);
 }
 
 function nativeRequestInput(
@@ -183,6 +214,7 @@ function nativeRequestInput(
 	projected: ProjectedEntries,
 	branch: readonly SessionEntry[],
 	previous: NativeCompactionState | undefined,
+	leading: AgentMessage | undefined,
 ): ResponseItem[] {
 	// `buildContextEntries()` orders newest compaction, then retained pre-compaction
 	// entries, then new entries, so slicing the projection after the compaction would
@@ -191,7 +223,7 @@ function nativeRequestInput(
 	// omissions and replacements apply.
 	if (previous) {
 		const after = idsAfter(branch, previous.entryId);
-		if (after) return [...structuredClone(previous.output), ...projectedAfter(model, projected, after)];
+		if (after) return [...structuredClone(previous.output), ...projectedAfter(model, projected, after, leading)];
 	}
 	return projectedResponseItems(model, projected);
 }
@@ -424,7 +456,7 @@ async function nativeAndPortableCompaction(
 	const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 	const projection = ctx.sessionManager.buildSessionProjection();
 	const previous = findLatestNativeCompaction(event.branchEntries, model, identity);
-	const input = nativeRequestInput(model, projection.entries, event.branchEntries, previous);
+	const input = nativeRequestInput(model, projection.entries, event.branchEntries, previous, leadingSystemMessage(projection.messages));
 	const native = await requestProviderCompaction({
 		provider,
 		model: requestModel,
@@ -489,7 +521,7 @@ export default function (pi: ExtensionAPI): void {
 		if (!latest) return;
 		const projection = ctx.sessionManager.buildSessionProjection();
 		const after = idsAfter(branch, latest.entryId);
-		const postItems = after ? projectedAfter(model, projection.entries, after) : [];
+		const postItems = after ? projectedAfter(model, projection.entries, after, leadingSystemMessage(projection.messages)) : [];
 		const rewritten = rewriteResponsesPayload(event.payload, latest, postItems);
 		if (rewritten === event.payload || !isObject(rewritten)) return rewritten;
 		return rewritten;

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { getCurrentSystemPrompt, normalizeContext } from "@earendil-works/pi-ai";
+import { createInitialSystemMessage, getCurrentSystemPrompt, normalizeContext } from "@earendil-works/pi-ai";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import extension from "../index";
@@ -661,5 +661,36 @@ describe("portable summarization headers", () => {
 		} finally {
 			globalThis.fetch = originalFetch;
 		}
+	});
+});
+
+describe("mid-conversation patches", () => {
+	test("replay keeps a system section added right after the compaction", async () => {
+		const leading = createInitialSystemMessage("PROMPT", [{ name: "read", description: "Read a file", parameters: {} }])!;
+		const patchMessage = { role: "system", content: "PATCH", sections: { rule: "<rule>NEW_RULE</rule>" }, toolsAdded: [{ name: "write", description: "Write a file", parameters: {} }], timestamp: 2 };
+		const patchEntry = { type: "message", id: "m2", parentId: "c1", timestamp: "t2", message: patchMessage } as SessionEntry;
+		const native = compactionEntry(details({ output: [checkpoint] }));
+
+		const handlers = new Map<string, (event: any, ctx: any) => unknown>();
+		const api = {
+			on(name: string, handler: (event: any, ctx: any) => unknown) { handlers.set(name, handler); return () => {}; },
+			getFlag: () => undefined, getAllTools: () => [], getActiveTools: () => [],
+		};
+		(extension as any)(api);
+		const compatModel = { ...directModel, compat: { supportsMidConvoSystemMessages: true, supportsToolSearch: true } };
+		const ctx = {
+			cwd: "/tmp", isProjectTrusted: () => false, model: compatModel, thinkingLevel: undefined,
+			getSystemPrompt: () => "BASE",
+			sessionManager: {
+				getBranch: () => [native, patchEntry],
+				buildSessionProjection: () => ({ entries: [{ sourceEntry: native, messages: [leading] }, { sourceEntry: patchEntry, messages: [patchMessage] }], messages: [leading, patchMessage], thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
+			},
+			modelRegistry: { getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "k", headers: {}, env: {} }), getProvider: () => ({}) },
+		};
+		const payload = { model: "gpt-test", input: [{ role: "developer", content: "PROMPT" }] };
+		const result: any = await handlers.get("before_provider_request")!({ type: "before_provider_request", payload }, ctx);
+		const serialized = JSON.stringify(result.input);
+		expect(serialized).toContain("NEW_RULE");
+		expect(serialized).toContain("write");
 	});
 });
