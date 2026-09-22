@@ -46,6 +46,12 @@ Portable fallback means Pi's ordinary behavior, **not universal redaction protec
 
 Legacy v1/v2 whole-history checkpoints remain inspectable but are never reinterpreted as prefix-only state. Version 2 has a portable summary. Version 1's opaque placeholder does not; the extension warns rather than pretending that missing history is recoverable from the placeholder. Recover from earlier session history or begin a new session.
 
+## Diagnose portable fallback
+
+Run `/provider-compaction-status` to see whether the observer is installed, the latest capture status, and the last compaction attempt in this runtime. Portable fallback also appends a `pi-provider-compaction:diagnostic` session entry containing only a fixed reason string. It is not included in model context. Diagnostics never include request content, credentials, or backend error text.
+
+These diagnostics require the extension to be loaded when the attempt happens; they cannot explain earlier compactions retroactively. A committed native checkpoint does not by itself prove that a later request replayed it.
+
 ## Generic compaction-model override
 
 An explicit generic model takes precedence, matching `pi-compactor`:

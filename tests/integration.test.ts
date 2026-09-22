@@ -160,6 +160,7 @@ describe("Pi 0.87 runner + real Responses adapter", () => {
 			const result = await f.session.compact();
 			expect(f.requests.some((request) => new URL(request.url).pathname.endsWith("/compact"))).toBe(false);
 			expect((result.details as any).type).toBeUndefined();
+			expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({ data: { status: "portable: projected prefix differs from request context" } });
 		} finally { await f.close(); }
 	});
 	for (const change of ["payload", "policy", "history", "invalidate"] as const) test(`${change} change returns the untouched portable request`, async () => {
@@ -254,6 +255,15 @@ describe("Pi 0.87 runner + real Responses adapter", () => {
 			expect(result.summary).toContain("Portable summary fixture");
 			expect(f.requests.length - before).toBe(2);
 			expect((result.details as any).type).toBeUndefined();
+			expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({ data: { status: "portable: native acquisition or validation failed" } });
+			const notices: string[] = [];
+			const command = f.session.extensionRunner.getCommand("provider-compaction-status")!;
+			const context = f.session.extensionRunner.createCommandContext();
+			await command.handler("", { ...context, ui: { ...context.ui, notify: (message) => { notices.push(message); } } });
+			expect(notices[0]).toContain("Last attempt: portable: native acquisition or validation failed");
+			expect(notices[0]).not.toContain("fixture failure");
+			await f.session.prompt("C after portable fallback");
+			expect(JSON.stringify(f.requests.at(-1)!.body)).not.toContain("pi-provider-compaction:diagnostic");
 		} finally { await f.close(); }
 	});
 });

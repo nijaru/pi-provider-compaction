@@ -45,13 +45,14 @@ export interface PreparedRequest {
 
 export function capturePreparedRequest(
 	model: Model<any>, context: TranscriptContext, canonical: TranscriptContext, payload: unknown,
+	reject: (reason: string) => void = () => {},
 ): PreparedRequest | undefined {
-	if (!isObject(payload) || !Array.isArray(payload.input) || !payload.input.every(isObject)) return;
+	if (!isObject(payload) || !Array.isArray(payload.input) || !payload.input.every(isObject)) { reject("unsupported payload shape"); return; }
 	// Reject stateful provider requests: coverage must be the complete visible input.
-	if (payload.previous_response_id || payload.conversation) return;
-	if (Buffer.byteLength(JSON.stringify({ context, payload })) > MAX_SNAPSHOT_BYTES) return;
+	if (payload.previous_response_id || payload.conversation) { reject("stateful request"); return; }
+	if (Buffer.byteLength(JSON.stringify({ context, payload })) > MAX_SNAPSHOT_BYTES) { reject("snapshot exceeds size limit"); return; }
 	const expected = serializeInput(model, context);
-	if (!equal(expected, payload.input)) return;
+	if (!equal(expected, payload.input)) { reject("prepared input differs from serializer"); return; }
 	return { context: structuredClone(context), canonical: structuredClone(canonical), payload: structuredClone(payload) as PreparedRequest["payload"], portableInput: expected, createdAt: Date.now() };
 }
 
@@ -87,19 +88,20 @@ function mappedPrefix(snapshot: PreparedRequest, prefix: TranscriptContext): Tra
 	return normalizeContext({ messages: snapshot.context.messages.slice(0, prefix.messages.length) });
 }
 
-export function selectCoveredPrefix(model: Model<any>, snapshot: PreparedRequest, prefix: TranscriptContext): ResponseItem[] | undefined {
-	if (Date.now() - snapshot.createdAt > SNAPSHOT_TTL_MS || !closedTools(prefix)) return;
+export function selectCoveredPrefix(model: Model<any>, snapshot: PreparedRequest, prefix: TranscriptContext, reject: (reason: string) => void = () => {}): ResponseItem[] | undefined {
+	if (Date.now() - snapshot.createdAt > SNAPSHOT_TTL_MS) { reject("snapshot expired"); return; }
+	if (!closedTools(prefix)) { reject("prefix has an incomplete tool exchange or failed assistant"); return; }
 	const mapped = mappedPrefix(snapshot, prefix);
-	if (!mapped) return;
+	if (!mapped) { reject("projected prefix differs from request context"); return; }
 	const expected = serializeInput(model, mapped, snapshot.context);
-	if (!equal(snapshot.portableInput.slice(0, expected.length), expected)) return;
+	if (!equal(snapshot.portableInput.slice(0, expected.length), expected)) { reject("serialized prefix does not match prepared input"); return; }
 	const start = promptCount(expected);
 	let end = expected.length;
 	if (snapshot.replacement) {
-		if (snapshot.replacement.index < start || snapshot.replacement.index >= end) return;
+		if (snapshot.replacement.index < start || snapshot.replacement.index >= end) { reject("previous native slot is outside covered prefix"); return; }
 		end += snapshot.replacement.count - 1;
 	}
-	if (end <= start) return;
+	if (end <= start) { reject("empty covered prefix"); return; }
 	// Source is the prepared request, never the validator's reconstruction.
 	return structuredClone(snapshot.payload.input.slice(start, end));
 }

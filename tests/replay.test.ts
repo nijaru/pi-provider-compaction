@@ -39,6 +39,16 @@ describe("prefix-only request evidence", () => {
 		expect(capturePreparedRequest(model, context, context, { ...payload, previous_response_id: "hidden-server-context" })).toBeUndefined();
 		expect(capturePreparedRequest(model, context, context, { ...payload, oversized: "x".repeat(8 * 1024 * 1024) })).toBeUndefined();
 	});
+	test("diagnostics identify rejection without returning request content", () => {
+		const reasons: string[] = [];
+		const reject = (reason: string) => { reasons.push(reason); };
+		const payload = { input: serializeInput(model, context) };
+		expect(capturePreparedRequest(model, context, context, { input: [{ role: "user", content: "SECRET" }] }, reject)).toBeUndefined();
+		const snapshot = capturePreparedRequest(model, context, context, payload)!;
+		snapshot.createdAt -= SNAPSHOT_TTL_MS + 1;
+		expect(selectCoveredPrefix(model, snapshot, context, reject)).toBeUndefined();
+		expect(reasons).toEqual(["prepared input differs from serializer", "snapshot expired"]);
+	});
 	test("removed grammar declarations remain part of the policy fingerprint", () => {
 		const base = { ...model, compat: { supportsMidConvoSystemMessages: true, supportsOpenAIGrammarTools: true } };
 		const policy = (property: string) => {

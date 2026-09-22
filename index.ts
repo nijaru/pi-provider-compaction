@@ -155,17 +155,30 @@ export default function (pi: ExtensionAPI): void {
 	let uninstall: (() => void) | undefined;
 	let installedProvider: string | undefined;
 	let generation = 0;
-	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; active = undefined; pending = undefined; };
+	let captureStatus = "no request observed";
+	let compactionStatus = "not attempted in this runtime";
+	const captureRejected = (reason: string) => { captureStatus = reason; };
+	const fallback = (reason: string) => { compactionStatus = `portable: ${reason}`; };
+	pi.registerCommand("provider-compaction-status", {
+		description: "Show content-free native compaction eligibility and last attempt",
+		handler: async (_args, context) => {
+			context.ui.notify(`Provider compaction\nObserver: ${installedProvider ? "installed" : "unavailable for current registration"}\nCapture: ${captureStatus}\nLast attempt: ${compactionStatus}`, "info");
+		},
+	});
+	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; active = undefined; pending = undefined; captureStatus = "invalidated by lifecycle/history/policy change"; };
 	const generic = (context: ExtensionContext) => resolveCompactionModelPolicy(pi, context).hasSelectors;
 	const route = (model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions) => routeDigest({ model, apiKey: options.apiKey, headers: options.headers, env: options.env });
 	const unchanged = (branch: readonly SessionEntry[], length: number, hash: string) => branch.length >= length && digest(branch.slice(0, length)) === hash && !branch.slice(length).some((entry) => entry.type === "context_edit");
 
 	const observe: ObserveRequest = (model, context, options) => {
 		const owner = ctx;
-		if (!owner || !supportsNativeCompaction(model) || !options.onPayload || options.sessionId !== owner.sessionManager.getSessionId() || generic(owner)) return;
+		if (!owner || options.sessionId !== owner.sessionManager.getSessionId()) return;
+		if (!supportsNativeCompaction(model)) { captureRejected("unsupported API"); return; }
+		if (!options.onPayload) { captureRejected("no payload callback"); return; }
+		if (generic(owner)) { captureRejected("generic compaction model takes precedence"); return; }
 		// The Azure adapter also accepts API-specific overrides and process-env
 		// fallbacks. Those must not silently select a route absent from our evidence.
-		if (!supportedRouteOptions(model, options)) return;
+		if (!supportedRouteOptions(model, options)) { captureRejected("unsupported route overrides"); return; }
 		const ticket = generation;
 		const branch = owner.sessionManager.getBranch();
 		const branchHash = digest(branch);
@@ -174,7 +187,7 @@ export default function (pi: ExtensionAPI): void {
 		return async (payload) => {
 			if (!current()) return payload;
 			snapshot = undefined;
-			const prepared = capturePreparedRequest(model, context, canonical, payload);
+			const prepared = capturePreparedRequest(model, context, canonical, payload, captureRejected);
 			if (!prepared) { active = undefined; return payload; }
 			const auth = await owner.modelRegistry.getApiKeyAndHeaders(model);
 			if (!current()) return payload;
@@ -184,10 +197,11 @@ export default function (pi: ExtensionAPI): void {
 			const normalizedHeaders = (headers: ProviderHeaders | undefined) => Object.entries(headers ?? {}).map(([name, value]) => [name.toLowerCase(), value]).sort(([a], [b]) => String(a).localeCompare(String(b)));
 			if (!auth.ok || generic(owner) || auth.apiKey !== options.apiKey || (auth.baseUrl ?? model.baseUrl) !== model.baseUrl || !equal(normalizedHeaders(auth.headers), normalizedHeaders(options.headers)) || !equal(auth.env ?? {}, options.env ?? {})) {
 				active = undefined;
+				captureRejected("resolved auth/route differs from prepared request, or generic policy changed");
 				return payload;
 			}
 			const provider = owner.modelRegistry.getProvider(model.provider);
-			if (!provider) return payload;
+			if (!provider) { captureRejected("provider unavailable"); return payload; }
 			const routeHash = route(model, options);
 			const policyHash = digest(requestPolicy(model, prepared));
 			const latest = latestCompaction(branch);
@@ -207,6 +221,7 @@ export default function (pi: ExtensionAPI): void {
 					} else active = undefined;
 				} else active = undefined;
 			} else active = undefined;
+			captureStatus = "eligible prepared request captured";
 			snapshot = {
 				prepared, model: structuredClone(model), provider,
 				options: { apiKey: options.apiKey, headers: structuredClone(options.headers), env: structuredClone(options.env), fetch: options.fetch },
@@ -224,6 +239,7 @@ export default function (pi: ExtensionAPI): void {
 		if (!supportsNativeCompaction(context.model)) return;
 		uninstall = installObserver(pi, context, observe);
 		if (uninstall) installedProvider = context.model.provider;
+		captureStatus = uninstall ? "awaiting prepared request" : "unsupported provider registration";
 	};
 	pi.on("session_start", (_event, context) => {
 		invalidate(); install(context);
@@ -242,23 +258,25 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_before_compact", async (event, context) => {
 		const capture = snapshot;
 		snapshot = undefined; pending = undefined;
-		if (!capture || !context.model || generic(context) || event.signal.aborted) return;
+		if (!capture) { fallback(`no eligible snapshot (${captureStatus})`); return; }
+		if (!context.model || generic(context) || event.signal.aborted) { fallback("missing model, generic model override, or aborted attempt"); return; }
 		const protocol = resolveNativeProtocol(context.model);
-		if (!protocol || context.sessionManager.getSessionId() !== capture.sessionId) return;
+		if (!protocol || context.sessionManager.getSessionId() !== capture.sessionId) { fallback("unsupported protocol or changed session"); return; }
 		const ticket = generation;
 		const branch = context.sessionManager.getBranch();
 		const branchHash = digest(branch);
-		if (!equal(branch, event.branchEntries) || !unchanged(branch, capture.branchLength, capture.branchHash)) return;
+		if (!equal(branch, event.branchEntries) || !unchanged(branch, capture.branchLength, capture.branchHash)) { fallback("history changed since capture"); return; }
 		const projection = context.sessionManager.buildSessionProjection();
 		const boundary = projection.entries.findIndex((entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId);
-		if (boundary < 0) return;
+		if (boundary < 0) { fallback("retained boundary missing from projection"); return; }
 		const prefix = transcript(projection.entries.slice(0, boundary).flatMap((entry) => entry.messages));
-		const input = selectCoveredPrefix(capture.model, capture.prepared, prefix);
+		const input = selectCoveredPrefix(capture.model, capture.prepared, prefix, fallback);
 		if (!input) return;
 		const current = () => ticket === generation && !event.signal.aborted && supportedRouteOptions(capture.model, capture.options) && !generic(context) && context.modelRegistry.getProvider(capture.model.provider) === capture.provider && digest(context.sessionManager.getBranch()) === branchHash;
 		const auth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
 		if (!current()) return { cancel: true };
-		if (!auth.ok || routeDigest(auth) !== capture.authHash) return;
+		if (!auth.ok || routeDigest(auth) !== capture.authHash) { fallback("auth changed since capture"); return; }
+		compactionStatus = "generating portable summary";
 		let portable: Awaited<ReturnType<typeof compact>>;
 		try {
 			portable = await compact(event.preparation, capture.model, auth.apiKey, auth.headers as Record<string, string> | undefined, event.customInstructions, event.signal, context.thinkingLevel, capture.provider.streamSimple.bind(capture.provider), auth.env, undefined, undefined, capture.sessionId);
@@ -270,7 +288,8 @@ export default function (pi: ExtensionAPI): void {
 		try {
 			const freshAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
 			if (!current()) return { cancel: true };
-			if (!freshAuth.ok || routeDigest(freshAuth) !== capture.authHash) return { compaction: portable };
+			if (!freshAuth.ok || routeDigest(freshAuth) !== capture.authHash) { fallback("auth changed after portable generation"); return { compaction: portable }; }
+			compactionStatus = "requesting native checkpoint";
 			const native = await requestProviderCompaction({
 				provider: capture.provider, model: capture.model, context: capture.prepared.context,
 				input, preparedPayload: capture.prepared.payload, protocol,
@@ -280,7 +299,7 @@ export default function (pi: ExtensionAPI): void {
 			if (!current()) return { cancel: true };
 			const finalAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
 			if (!current()) return { cancel: true };
-			if (!finalAuth.ok || routeDigest(finalAuth) !== capture.authHash) return { compaction: portable };
+			if (!finalAuth.ok || routeDigest(finalAuth) !== capture.authHash) { fallback("auth changed after native generation"); return { compaction: portable }; }
 			const details: NativeCompactionDetails = {
 				...(isObject(portable.details) ? portable.details : {}),
 				type: NATIVE_COMPACTION_TYPE, version: 3, provider: capture.model.provider, api: capture.model.api, model: capture.model.id,
@@ -292,11 +311,17 @@ export default function (pi: ExtensionAPI): void {
 			return { compaction: { ...portable, usage: combineUsage(native.usage, portable.usage), details } };
 		} catch {
 			if (!current()) return { cancel: true };
+			// Do not expose exception text: provider errors may contain request data.
+			fallback("native acquisition or validation failed");
 			// The portable request already succeeded. Never pay for a duplicate summary.
 			return { compaction: portable };
 		}
 	});
 	pi.on("session_compact", (event, context) => {
+		if (readNativeCompactionDetails(event.compactionEntry.details)?.version === 3) compactionStatus = "native checkpoint committed";
+		else if (!compactionStatus.startsWith("portable:")) fallback("another handler supplied the committed result");
+		// Only static diagnostics are persisted, never request/auth data or error text.
+		if (compactionStatus.startsWith("portable:")) pi.appendEntry("pi-provider-compaction:diagnostic", { status: compactionStatus });
 		active = undefined; snapshot = undefined;
 		const candidate = pending; pending = undefined;
 		if (!candidate || !equal(event.compactionEntry.details, candidate.details) || event.compactionEntry.summary !== candidate.summary) return;
@@ -305,5 +330,5 @@ export default function (pi: ExtensionAPI): void {
 		if (!coverage || event.compactionEntry.firstKeptEntryId !== coverage.firstKeptEntryId || event.compactionEntry.parentId !== coverage.sourceLeafId || branch.at(-1)?.id !== event.compactionEntry.id || digest(branch.slice(0, -1)) !== coverage.sourceHash) return;
 		active = { entryId: event.compactionEntry.id, detailsHash: digest(candidate.details), summary: candidate.summary, branchLength: branch.length, branchHash: digest(branch), routeHash: candidate.capture.routeHash, policyHash: candidate.capture.policyHash };
 	});
-	pi.on("session_compact_failed", () => { pending = undefined; snapshot = undefined; });
+	pi.on("session_compact_failed", () => { pending = undefined; snapshot = undefined; compactionStatus = "compaction failed or cancelled"; });
 }
