@@ -1,30 +1,33 @@
 # pi-provider-compaction
 
-Provider-native compaction adapters for Pi.
+Experimental provider-native compaction for Pi 0.87.0. Keep global activation and publishing separate from development validation.
 
 ## Product boundaries
 
-- Native protocol selection is automatic from the active Pi API adapter. Do not require a user-facing provider-compaction mode selector.
-- `pi-compactor` owns when to compact and continuation. A deliberately configured generic compaction model may override native compaction; otherwise supported native routes are automatic.
-- Persist a meaningful portable Pi summary and validated native state at the same committed boundary. Never replace the portable summary with an opaque placeholder in new sessions.
-- Keep provider/API/model plus stable endpoint/account/deployment identity with native state. Never persist raw API keys, OAuth access tokens, management credentials, or complete auth headers.
-- `pi-fast-mode` owns `/fast`; `pi-usage` owns read-only account reporting. Do not merge those responsibilities here.
-- Unsupported or failed native routes fall back to Pi. Do not probe paid protocols in sequence or silently change providers.
+- Select native protocols from the active API; do not add a provider mode selector or probe paid alternatives.
+- `pi-compactor` owns timing and continuation. Its explicit generic-model selection takes precedence.
+- Commit a meaningful portable summary and validated native state together. If native acquisition fails after portable generation, return that portable result without another summary request.
+- `pi-fast-mode` owns `/fast`; `pi-usage` owns account reporting.
 
-## Protocol rules
+## Safety contracts
 
-- Pass resolved `ProviderHeaders` through to summary and transport requests unchanged. `null` deletes a provider default header; filtering it out restores the header the auth config disabled.
-- Native request input and replay take message *content* from Pi's canonical `buildSessionProjection()` (so `context_edit` omissions and replacements apply), but select the post-compaction *boundary* from raw branch order. The projection lists the newest compaction first, then retained pre-compaction entries, so slicing the projection replays retained history twice.
-- The Responses API carries the prompt in the leading `system`/`developer` input item, not `instructions`. Replay preserves that item; never synthesize `instructions` from `ctx.getSystemPrompt()`, which omits `context_with_system` transformations. The native compact *request* intentionally excludes the prompt: it compacts the conversation, and the live prompt is re-supplied from the request payload on replay (a compaction-time prompt would freeze a stale one).
-- When serializing post-boundary items, prepend the projection's leading system message so a system update landing first in the slice is rendered as a mid-conversation update instead of being treated (and dropped) as the leading prompt.
-- Reconstruction passes the provider's Responses compat flags (`model.compat`), mirroring the adapter's `getCompat()`. Without them, mid-conversation system updates are collapsed and tool-addition items are dropped.
-- Native request input and replay must follow Pi's canonical `buildSessionProjection()`, never raw entries. `context_edit` omissions and replacements are invisible to `buildContextEntries()` and `sessionEntryToContextMessages()`, so a raw rebuild resurrects context Pi no longer sends.
-- Use Pi's active provider transport to obtain the real request URL, authentication, deployment/version semantics, and provider request shape.
-- Standalone Responses compaction preserves the full canonical returned output window. Validate size and checkpoint structure; do not prune it.
-- Codex Remote V2 appends `compaction_trigger` through the provider payload hook and inspects the actual SSE response while letting Pi's provider consume the same response.
-- In-stream `context_management` is unsupported until Pi exposes enough response/checkpoint state to validate and persist emitted compaction items. Setting the request field alone is not support.
-- Keep legacy v1 checkpoints readable without bulk-rewriting session history.
+- Native coverage ends **before `firstKeptEntryId`**, not at the compaction entry ID. Replay replaces only the portable-summary contribution and preserves the actual request's suffix and other fields.
+- Capture after the entire incoming `onPayload` callback. Persisted projection and serializer output are validators/provenance only, never sources for native request content or a reconstructed live suffix.
+- Use `buildSessionProjection()` for context-edit-aware provenance. Reject stale, incomplete or ambiguous mappings and open tool exchanges. Never recover redacted text from raw entries.
+- V3 is prefix-aligned; v1/v2 are not. Legacy v1 lacks meaningful portable fallback. Do not silently replay or reinterpret legacy state.
+- Native eligibility is runtime-local. Invalidate on lifecycle, history, policy and route changes; hidden state cannot be certified by matching visible summary text. See README for the dynamic-privacy exclusion.
+- Persist no raw keys, tokens, complete headers or request snapshots. Pass resolved headers, including `null` deletions, unchanged to provider transports.
+- Codex uses top-level `instructions`; direct OpenAI/Azure serialize the prompt into `input`. The validator must mirror grammar-tool properties and API-specific strict defaults, and reject drift.
+- Preserve complete validated native output windows. Bound both transport output and persisted-state parsing. Do not enable in-stream `context_management` without checkpoint capture.
+
+## Provider ownership
+
+- Pi 0.87.0 registration is replacement, not middleware. Decorate registered native **bases**, never effective composed providers; the latter loses legacy model headers and embeds stale configuration.
+- Only decorate existing static legacy `streamSimple` owners. Preserve their callback receiver and all configuration. Exclude dynamic legacy catalogs/OAuth model projections and unregistered builtin overlays.
+- Restore registration only while still owning the slot. Preserve intervening unrelated configuration changes. Never change full-stream semantics just to obtain a capture hook.
 
 ## Development
 
-Use Bun/TypeScript and Pi 0.87.0-compatible public APIs (verified floor; dev dependencies pin 0.87.0 and `bun run check` is the compatibility gate). `index.ts` owns session integration/replay, `protocol.ts` owns provider transport and validation, and `policy.ts` mirrors `pi-compactor`'s optional generic-model precedence. Run `bun run check` and `git diff --check`; authenticated endpoint checks must be reported separately from fixture coverage.
+Use Bun/TypeScript. Dependencies pin the verified Pi 0.87.0 floor. `index.ts` owns lifecycle and compaction; `provider.ts` owns capture-hook installation; `replay.ts` owns exact mapping and substitution; `protocol.ts` owns transport/validation; `policy.ts` mirrors generic-model precedence.
+
+Run `bun run check`, `bun run build`, and `git diff --check`. The manifest loads ignored `dist/index.js`, so rebuild before local Pi testing. Exercise real Pi runner/adapters with fake transports. Report authenticated backend tests separately; fixtures alone do not establish production readiness.

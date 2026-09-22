@@ -29,15 +29,17 @@
     "build": "bun run build.ts",
     "prepack": "bun run build",
     "test": "bun test",
-    "lint": "oxlint build.ts index.ts protocol.ts policy.ts tests/",
+    "lint": "oxlint build.ts index.ts protocol.ts policy.ts provider.ts replay.ts tests/",
     "typecheck": "tsc --noEmit",
-    "check": "bun test && oxlint build.ts index.ts protocol.ts policy.ts tests/ && tsc --noEmit"
+    "check": "bun test && bun run lint && tsc --noEmit"
   },
   "files": [
     "dist",
     "index.ts",
     "protocol.ts",
     "policy.ts",
+    "provider.ts",
+    "replay.ts",
     "README.md",
     "LICENSE"
   ],

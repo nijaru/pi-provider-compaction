@@ -46,13 +46,37 @@ function validateItemSize(item: ResponseItem): void {
 	if (byteLength(item) > MAX_ITEM_BYTES) throw new Error("Native compaction output item exceeded 2 MiB");
 }
 
+function validContent(value: unknown): boolean {
+	return typeof value === "string" || (Array.isArray(value) && value.every((part) => {
+		if (!isObject(part)) return false;
+		if (part.type === "input_text" || part.type === "output_text" || part.type === "summary_text") return typeof part.text === "string";
+		if (part.type === "input_image") return typeof part.image_url === "string" || typeof part.file_id === "string";
+		if (part.type === "refusal") return typeof part.refusal === "string";
+		return false;
+	}));
+}
+
 export function validateCompactedOutput(value: unknown): ResponseItem[] {
 	if (!isObject(value) || !Array.isArray(value.output) || value.output.length === 0) {
 		throw new Error("Responses Compact returned an invalid output window");
 	}
+	if (byteLength(value.output) > MAX_RESPONSE_BYTES) throw new Error("Native compaction output exceeded 8 MiB");
 	const output = value.output.map((item) => {
 		if (!isObject(item)) throw new Error("Responses Compact returned a non-object output item");
 		validateItemSize(item);
+		const type = item.type ?? (typeof item.role === "string" ? "message" : undefined);
+		if (!["compaction", "message", "reasoning", "function_call", "function_call_output", "custom_tool_call", "custom_tool_call_output", "tool_search_call", "tool_search_output", "additional_tools"].includes(String(type))) throw new Error("Responses Compact returned an unsupported output item");
+		if (type === "message" && (!["user", "assistant", "system", "developer"].includes(String(item.role)) || !validContent(item.content))) throw new Error("Responses Compact returned an invalid message item");
+		if (type === "compaction" && !isCompactionItem(item)) throw new Error("Responses Compact returned an invalid checkpoint");
+		if (type === "reasoning" && !(typeof item.encrypted_content === "string" || (Array.isArray(item.summary) && validContent(item.summary)))) throw new Error("Responses Compact returned invalid reasoning");
+		if (String(type).includes("call") || type === "tool_search_output") {
+			if (typeof item.call_id !== "string" || !item.call_id) throw new Error("Responses Compact returned an invalid tool id");
+			if (type === "function_call" && (typeof item.name !== "string" || typeof item.arguments !== "string")) throw new Error("Responses Compact returned an invalid function call");
+			if (type === "custom_tool_call" && (typeof item.name !== "string" || typeof item.input !== "string")) throw new Error("Responses Compact returned an invalid custom call");
+			if ((type === "function_call_output" || type === "custom_tool_call_output") && !validContent(item.output)) throw new Error("Responses Compact returned an invalid tool output");
+			if (type === "tool_search_call" && !isObject(item.arguments)) throw new Error("Responses Compact returned an invalid tool search");
+		}
+		if ((type === "additional_tools" || type === "tool_search_output") && (!Array.isArray(item.tools) || !item.tools.every(isObject))) throw new Error("Responses Compact returned invalid tools");
 		return structuredClone(item);
 	});
 	const checkpoints = output.filter(isCompactionItem);
@@ -85,6 +109,7 @@ async function readJsonBounded(response: Response, signal: AbortSignal): Promise
 		}
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+		void reader.cancel().catch(() => undefined);
 		reader.releaseLock();
 	}
 	const bytes = new Uint8Array(total);
@@ -195,6 +220,8 @@ interface TransportRequest {
 	model: Model<any>;
 	context: TranscriptContext;
 	input: ResponseItem[];
+	/** Fully prepared request snapshot; only its validated prefix is sent. */
+	preparedPayload?: JsonObject;
 	apiKey?: string;
 	headers?: ProviderHeaders;
 	env?: Record<string, string>;
@@ -251,7 +278,8 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 		fetch: bridgeFetch,
 		onPayload: (payload: unknown) => {
 			if (!isObject(payload)) throw new Error("Responses provider exposed a non-object payload");
-			preparedPayload = { ...structuredClone(payload), input: structuredClone(request.input) };
+			if (request.preparedPayload && request.preparedPayload.model !== payload.model) throw new Error("Native route model changed since capture");
+			preparedPayload = { ...structuredClone(request.preparedPayload ?? payload), input: structuredClone(request.input) };
 			return preparedPayload;
 		},
 	});
@@ -325,6 +353,7 @@ async function collectCompactionSse(stream: ReadableStream<Uint8Array>, signal: 
 		dispatch();
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+		void reader.cancel().catch(() => undefined);
 		reader.releaseLock();
 	}
 	if (!completed) throw new Error("Remote V2 stream ended without response.completed");
@@ -359,12 +388,16 @@ function buildRemoteV2History(input: ResponseItem[], item: ResponseItem): Respon
 async function requestRemoteV2(request: TransportRequest): Promise<TransportResponse> {
 	const baseFetch = request.fetch ?? globalThis.fetch;
 	let sentInput: ResponseItem[] | undefined;
-	const inspections: Promise<CollectedSse>[] = [];
+	const controller = new AbortController();
+	const signal = AbortSignal.any([request.signal, controller.signal]);
+	const inspections: Promise<{ result: CollectedSse } | { error: unknown }>[] = [];
 	const inspectedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const response = await baseFetch(input, init);
 		if (!response.ok || !response.body) return response;
 		const [providerBody, inspectionBody] = response.body.tee();
-		inspections.push(collectCompactionSse(inspectionBody, request.signal));
+		// Attach the rejection handler immediately: inspection can fail before the
+		// provider finishes consuming its half of the stream.
+		inspections.push(collectCompactionSse(inspectionBody, signal).then((result) => ({ result }), (error: unknown) => ({ error })));
 		return new Response(providerBody, {
 			status: response.status,
 			statusText: response.statusText,
@@ -384,19 +417,24 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 		onPayload: (payload: unknown) => {
 			if (!isObject(payload)) throw new Error("Codex provider exposed a non-object payload");
 			sentInput = structuredClone(request.input);
-			return { ...structuredClone(payload), input: [...sentInput, { type: "compaction_trigger" }] };
+			if (request.preparedPayload && request.preparedPayload.model !== payload.model) throw new Error("Native route model changed since capture");
+			return { ...structuredClone(request.preparedPayload ?? payload), stream: true, input: [...sentInput, { type: "compaction_trigger" }] };
 		},
 	});
-	const usage = await collectProviderUsage(stream, request.signal);
-	if (!sentInput || inspections.length !== 1) {
-		throw new Error(`Remote V2 observed ${inspections.length} successful provider responses; expected exactly one`);
+	try {
+		const usage = await collectProviderUsage(stream, request.signal);
+		if (!sentInput || inspections.length !== 1) throw new Error(`Remote V2 observed ${inspections.length} successful provider responses; expected exactly one`);
+		const inspection = await inspections[0]!;
+		if ("error" in inspection) throw inspection.error;
+		return { output: buildRemoteV2History(sentInput, inspection.result.item), usage };
+	} finally {
+		controller.abort();
 	}
-	const inspection = await inspections[0];
-	return { output: buildRemoteV2History(sentInput, inspection.item), usage };
 }
 
 export async function requestProviderCompaction(
 	request: TransportRequest & { protocol: NativeProtocol },
 ): Promise<TransportResponse> {
-	return request.protocol === "remote-v2" ? requestRemoteV2(request) : requestResponsesCompact(request);
+	const result = await (request.protocol === "remote-v2" ? requestRemoteV2(request) : requestResponsesCompact(request));
+	return { ...result, output: validateCompactedOutput(result) };
 }

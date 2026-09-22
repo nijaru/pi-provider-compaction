@@ -1,38 +1,15 @@
+import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
-import { calculateCost, normalizeContext } from "@earendil-works/pi-ai";
-import type { Model, TranscriptContext, Usage } from "@earendil-works/pi-ai";
-import type {
-	ExtensionAPI,
-	ExtensionContext,
-	SessionBeforeCompactEvent,
-	SessionEntry,
-} from "@earendil-works/pi-coding-agent";
-import {
-	compact,
-	convertToLlm,
-} from "@earendil-works/pi-coding-agent";
+import { normalizeContext, type Model, type Provider, type ProviderHeaders, type ProviderStreamOptions, type SimpleStreamOptions, type TranscriptContext, type Usage } from "@earendil-works/pi-ai";
+import { compact, convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveCompactionModelPolicy } from "./policy";
-import {
-	isCompactionItem,
-	isObject,
-	requestProviderCompaction,
-	resolveNativeProtocol,
-	supportsResponsesApi,
-	type NativeProtocol,
-	type ResponseItem,
-} from "./protocol";
+import { installObserver, type ObserveRequest } from "./provider";
+import { capturePreparedRequest, equal, requestPolicy, selectCoveredPrefix, substituteSummary, summarySlot, type PreparedRequest } from "./replay";
+import { isObject, requestProviderCompaction, resolveNativeProtocol, supportsResponsesApi, validateCompactedOutput, type NativeProtocol, type ResponseItem } from "./protocol";
 
 export const NATIVE_COMPACTION_TYPE = "pi-provider-compaction/openai-responses";
-export const NATIVE_COMPACTION_VERSION = 2;
-/** Legacy v1 visible summary, retained only for old sessions/tests. New compactions persist a real portable summary. */
-export const NATIVE_COMPACTION_SUMMARY =
-	"This context was compacted using the provider's native OpenAI Responses state.";
-
-const TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
-
-type JsonObject = Record<string, unknown>;
-type FetchImplementation = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+export const NATIVE_COMPACTION_VERSION = 3;
+export const NATIVE_COMPACTION_SUMMARY = "This context was compacted using the provider's native OpenAI Responses state.";
 
 export interface NativeIdentity {
 	endpoint: string;
@@ -42,498 +19,291 @@ export interface NativeIdentity {
 	azureApiVersion?: string;
 	azureDeployment?: string;
 }
-
 export interface NativeCompactionDetails {
 	type: typeof NATIVE_COMPACTION_TYPE;
-	version: 1 | typeof NATIVE_COMPACTION_VERSION;
+	version: 1 | 2 | 3;
 	provider: string;
 	api: string;
 	model: string;
 	protocol: NativeProtocol;
 	identity?: NativeIdentity;
 	output: ResponseItem[];
-	/** Native protocol usage. `usage` is a legacy alias accepted for v1 compatibility. */
 	nativeUsage?: Usage;
-	usage?: Usage;
 	portableUsage?: Usage;
+	usage?: Usage;
 	readFiles?: string[];
 	modifiedFiles?: string[];
-}
-
-interface NativeCompactionState extends NativeCompactionDetails {
-	entryId: string;
-}
-
-export function supportsNativeCompaction(model: Model<any> | undefined): model is Model<any> {
-	return supportsResponsesApi(model);
-}
-
-function readUsage(value: unknown): Usage | undefined {
-	if (!isObject(value) || !isObject(value.cost)) return undefined;
-	for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) {
-		if (typeof value[key] !== "number" || !Number.isFinite(value[key])) return undefined;
-	}
-	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) {
-		if (typeof value.cost[key] !== "number" || !Number.isFinite(value.cost[key])) return undefined;
-	}
-	return value as unknown as Usage;
-}
-
-function readIdentity(value: unknown): NativeIdentity | undefined {
-	if (!isObject(value) || typeof value.endpoint !== "string" || !value.endpoint) return undefined;
-	for (const key of ["organization", "project", "accountId", "azureApiVersion", "azureDeployment"] as const) {
-		if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
-	}
-	return {
-		endpoint: value.endpoint,
-		organization: value.organization as string | undefined,
-		project: value.project as string | undefined,
-		accountId: value.accountId as string | undefined,
-		azureApiVersion: value.azureApiVersion as string | undefined,
-		azureDeployment: value.azureDeployment as string | undefined,
+	coverage?: {
+		kind: "summarized-prefix";
+		firstKeptEntryId: string;
+		sourceLeafId: string;
+		sourceHash: string;
+		policyHash: string;
+		inputHash: string;
+		runtimeId: string;
 	};
 }
 
+export const supportsNativeCompaction = supportsResponsesApi;
+const digest = (value: unknown) => createHash("sha256").update(JSON.stringify(value)).digest("hex");
+const transcript = (messages: AgentMessage[]): TranscriptContext => normalizeContext({ messages: convertToLlm(messages) });
+
+/** Legacy state is inspectable, but its whole-window coverage is never replayed as v3. */
 export function readNativeCompactionDetails(value: unknown): NativeCompactionDetails | undefined {
-	if (!isObject(value) || value.type !== NATIVE_COMPACTION_TYPE) return undefined;
-	if (value.version !== 1 && value.version !== NATIVE_COMPACTION_VERSION) return undefined;
-	if (typeof value.provider !== "string" || typeof value.api !== "string" || typeof value.model !== "string") return undefined;
-	if (!Array.isArray(value.output) || !value.output.every(isObject) || !value.output.some(isCompactionItem)) return undefined;
-	const protocol = value.version === 1
-		? "responses-compact"
-		: value.protocol === "responses-compact" || value.protocol === "remote-v2"
-			? value.protocol
-			: undefined;
-	if (!protocol) return undefined;
-	const strings = (candidate: unknown): string[] | undefined =>
-		candidate === undefined ? undefined : Array.isArray(candidate) && candidate.every((item) => typeof item === "string") ? [...candidate] : undefined;
-	return {
-		type: NATIVE_COMPACTION_TYPE,
-		version: value.version,
-		provider: value.provider,
-		api: value.api,
-		model: value.model,
-		protocol,
-		identity: value.version === 1 ? undefined : readIdentity(value.identity),
-		output: structuredClone(value.output) as ResponseItem[],
-		nativeUsage: readUsage(value.nativeUsage ?? value.usage),
-		usage: readUsage(value.usage),
-		portableUsage: readUsage(value.portableUsage),
-		readFiles: strings(value.readFiles),
-		modifiedFiles: strings(value.modifiedFiles),
-	};
+	if (!isObject(value) || value.type !== NATIVE_COMPACTION_TYPE || (value.version !== 1 && value.version !== 2 && value.version !== 3)) return;
+	if (typeof value.provider !== "string" || typeof value.api !== "string" || typeof value.model !== "string") return;
+	const protocol = value.version === 1 ? "responses-compact" : value.protocol;
+	if (protocol !== "responses-compact" && protocol !== "remote-v2") return;
+	try {
+		const output = validateCompactedOutput(value);
+		if (value.version === 3) {
+			const coverage = value.coverage;
+			if (!isObject(coverage) || coverage.kind !== "summarized-prefix") return;
+			for (const field of ["firstKeptEntryId", "sourceLeafId", "sourceHash", "policyHash", "inputHash", "runtimeId"]) {
+				if (typeof coverage[field] !== "string" || !coverage[field]) return;
+			}
+			if (!isObject(value.identity) || typeof value.identity.endpoint !== "string") return;
+		}
+		return { ...structuredClone(value), protocol, output } as unknown as NativeCompactionDetails;
+	} catch { return; }
 }
 
-function identityEqual(left: NativeIdentity | undefined, right: NativeIdentity | undefined): boolean {
-	// A missing stored identity (legacy v1) matches any route; a missing query
-	// identity means "do not filter", which is how the replay pre-check asks for
-	// the latest native compaction before resolving the current route identity.
-	if (!left || !right) return true;
-	return left.endpoint === right.endpoint && left.organization === right.organization && left.project === right.project && left.accountId === right.accountId && left.azureApiVersion === right.azureApiVersion && left.azureDeployment === right.azureDeployment;
-}
-
-export function findLatestNativeCompaction(
-	entries: readonly SessionEntry[],
-	model: Model<any> | undefined,
-	identity?: NativeIdentity,
-): NativeCompactionState | undefined {
-	if (!supportsNativeCompaction(model)) return undefined;
-	for (let index = entries.length - 1; index >= 0; index--) {
-		const entry = entries[index];
-		if (entry.type !== "compaction") continue;
-		const details = readNativeCompactionDetails(entry.details);
-		if (!details) return undefined;
-		if (details.provider !== model.provider || details.api !== model.api || details.model !== model.id) return undefined;
-		if (!identityEqual(details.identity, identity)) return undefined;
-		return { ...details, entryId: entry.id };
+function latestCompaction(branch: readonly SessionEntry[]) {
+	for (let index = branch.length - 1; index >= 0; index--) {
+		const entry = branch[index]!;
+		if (entry.type === "compaction") return entry;
 	}
 	return undefined;
 }
 
-/**
- * Mirrors the Responses adapter's `getCompat()` for `convertResponsesMessages`. Without
- * these flags the reconstruction collapses mid-conversation system updates and drops
- * tool-addition items, so replayed context would lose instructions or tools.
- */
-function responsesConversionOptions(model: Model<any>): Parameters<typeof convertResponsesMessages>[3] {
-	const compat = (model as { compat?: Record<string, unknown> }).compat ?? {};
-	const flag = (key: string) => compat[key] === true;
-	return {
-		includeSystemPrompt: false,
-		supportsMidConvoSystemMessages: flag("supportsMidConvoSystemMessages"),
-		supportsAdditionalTools: flag("supportsAdditionalTools"),
-		supportsToolSearch: flag("supportsToolSearch"),
-		toolOptions: {
-			supportsStrictMode: flag("supportsStrictMode"),
-			supportsOpenAIGrammarTools: flag("supportsOpenAIGrammarTools"),
-		},
-	};
+function header(headers: ProviderHeaders | undefined, name: string): string | undefined {
+	const value = Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === name)?.[1];
+	return typeof value === "string" && value ? value : undefined;
 }
-
-function responseItemsFromMessages(model: Model<any>, messages: AgentMessage[]): ResponseItem[] {
-	const input = convertResponsesMessages(
-		model,
-		normalizeContext({ messages: convertToLlm(messages), tools: [] }),
-		TOOL_CALL_PROVIDERS,
-		responsesConversionOptions(model),
-	);
-	return input.filter(isObject) as unknown as ResponseItem[];
-}
-
-/** Model-visible entries from Pi's canonical projection, with source provenance. */
-type ProjectedEntries = readonly { sourceEntry: SessionEntry; messages: AgentMessage[] }[];
-
-function projectedResponseItems(model: Model<any>, entries: ProjectedEntries): ResponseItem[] {
-	return responseItemsFromMessages(model, entries.flatMap((entry) => entry.messages));
-}
-
-/** Raw-order entry ids after `entryId`; undefined when the entry is not on the branch. */
-function idsAfter(branch: readonly SessionEntry[], entryId: string): ReadonlySet<string> | undefined {
-	const index = branch.findIndex((entry) => entry.id === entryId);
-	return index >= 0 ? new Set(branch.slice(index + 1).map((entry) => entry.id)) : undefined;
-}
-
-function leadingSystemMessage(messages: readonly AgentMessage[]): AgentMessage | undefined {
-	return messages.length > 0 && messages[0]?.role === "system" ? messages[0] : undefined;
-}
-
-/**
- * Projected (context_edit-applied) messages for entries chronologically after the boundary.
- * The projection's leading system message is prepended so that a system update landing at the
- * start of the slice is serialized as a mid-conversation update instead of the leading prompt
- * (which `includeSystemPrompt: false` would then drop).
- */
-function projectedAfter(model: Model<any>, entries: ProjectedEntries, afterIds: ReadonlySet<string>, leading: AgentMessage | undefined): ResponseItem[] {
-	const messages = entries.filter((entry) => afterIds.has(entry.sourceEntry.id)).flatMap((entry) => entry.messages);
-	const prefixed = leading !== undefined && messages[0]?.role === "system" ? [leading, ...messages] : messages;
-	return responseItemsFromMessages(model, prefixed);
-}
-
-function nativeRequestInput(
-	model: Model<any>,
-	projected: ProjectedEntries,
-	branch: readonly SessionEntry[],
-	previous: NativeCompactionState | undefined,
-	leading: AgentMessage | undefined,
-): ResponseItem[] {
-	// `buildContextEntries()` orders newest compaction, then retained pre-compaction
-	// entries, then new entries, so slicing the projection after the compaction would
-	// replay the retained history twice. The chronological boundary comes from the raw
-	// branch; message content still comes from the canonical projection so context_edit
-	// omissions and replacements apply.
-	if (previous) {
-		const after = idsAfter(branch, previous.entryId);
-		if (after) return [...structuredClone(previous.output), ...projectedAfter(model, projected, after, leading)];
-	}
-	return projectedResponseItems(model, projected);
-}
-
-function authHeaders(apiKey: string | undefined, headers: Record<string, string | null> | undefined): Record<string, string> {
-	const result: Record<string, string> = { "content-type": "application/json" };
-	let hasAuthorization = false;
-	for (const [name, value] of Object.entries(headers ?? {})) {
-		if (value === null) continue;
-		result[name] = value;
-		if (name.toLowerCase() === "authorization" && value.trim()) hasAuthorization = true;
-	}
-	if (!hasAuthorization && apiKey) result.authorization = `Bearer ${apiKey}`;
-	return result;
-}
-
-export interface CompactRequestOptions {
-	model: Model<any>;
-	baseUrl: string;
-	apiKey?: string;
-	headers?: Record<string, string | null>;
-	input: ResponseItem[];
-	instructions?: string;
-	signal?: AbortSignal;
-	fetchImpl?: FetchImplementation;
-}
-
-export async function compactOpenAIResponses(options: CompactRequestOptions): Promise<NativeCompactionDetails> {
-	const endpoint = `${options.baseUrl.replace(/\/+$/, "")}/responses/compact`;
-	const body: JsonObject = { model: options.model.id, input: options.input };
-	if (options.instructions) body.instructions = options.instructions;
-	const response = await (options.fetchImpl ?? fetch)(endpoint, {
-		method: "POST",
-		headers: authHeaders(options.apiKey, options.headers),
-		body: JSON.stringify(body),
-		signal: options.signal,
-	});
-	if (!response.ok) {
-		const detail = await response.text().catch(() => "");
-		throw new Error(`OpenAI Responses compact request failed (${response.status}${detail ? `: ${detail.slice(0, 400)}` : ""})`);
-	}
-	const result: unknown = await response.json();
-	if (!isObject(result) || !Array.isArray(result.output) || !result.output.every(isObject) || !result.output.some(isCompactionItem)) {
-		throw new Error("OpenAI Responses compact response did not contain opaque compaction state");
-	}
-	const usage = compactUsage(options.model, result);
-	return {
-		type: NATIVE_COMPACTION_TYPE,
-		version: NATIVE_COMPACTION_VERSION,
-		provider: options.model.provider,
-		api: options.model.api,
-		model: options.model.id,
-		protocol: "responses-compact",
-		output: structuredClone(result.output) as ResponseItem[],
-		nativeUsage: usage,
-		usage,
-	};
-}
-
-function compactUsage(model: Model<any>, result: JsonObject): Usage | undefined {
-	const usage = result.usage;
-	if (!isObject(usage)) return undefined;
-	const cached = nestedNumber(usage.input_tokens_details, "cached_tokens");
-	const cacheWrite = nestedNumber(usage.input_tokens_details, "cache_write_tokens");
-	const mapped: Usage = {
-		input: Math.max(0, readNumber(usage.input_tokens) - cached - cacheWrite),
-		output: readNumber(usage.output_tokens),
-		cacheRead: cached,
-		cacheWrite,
-		reasoning: nestedNumber(usage.output_tokens_details, "reasoning_tokens"),
-		totalTokens: readNumber(usage.total_tokens),
-		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-	};
-	try { calculateCost(model, mapped); } catch {}
-	return mapped;
-}
-
-function readNumber(value: unknown): number {
-	return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function nestedNumber(value: unknown, key: string): number {
-	return isObject(value) ? readNumber(value[key]) : 0;
-}
-
-/**
- * Leading system/developer items are the serialized prompt (Pi's Responses API keeps
- * the prompt in `input`, not `instructions`). Replacing `input` must keep them.
- */
-function leadingPromptItems(items: readonly ResponseItem[]): ResponseItem[] {
-	const leading: ResponseItem[] = [];
-	for (const item of items) {
-		const role = typeof item.role === "string" ? item.role : undefined;
-		if (role === "system" || role === "developer") leading.push(item);
-		else break;
-	}
-	return leading;
-}
-
-export function rewriteResponsesPayload(
-	payload: unknown,
-	details: NativeCompactionDetails,
-	postCompactionItems: ResponseItem[],
-): unknown {
-	if (!isObject(payload) || !Array.isArray(payload.input)) return payload;
-	const currentInput = payload.input.filter(isObject) as ResponseItem[];
-	if (currentInput.length !== payload.input.length) return payload;
-	// The native output replaces the whole compacted prefix, and `postCompactionItems`
-	// is everything chronologically after the compaction. Splicing the current input by
-	// subsequence match re-appended already-compacted retained history whenever the
-	// post-compaction sequence was empty.
-	return {
-		...payload,
-		input: [
-			...structuredClone(leadingPromptItems(currentInput)),
-			...structuredClone(details.output),
-			...structuredClone(postCompactionItems),
-		],
-	};
-}
-
-function genericCompactionSelected(
-	pi: Pick<ExtensionAPI, "getFlag">,
-	ctx: Pick<ExtensionContext, "cwd" | "isProjectTrusted" | "sessionManager">,
-): boolean {
-	return resolveCompactionModelPolicy(pi, ctx).hasSelectors;
-}
-
-function normalizedEndpoint(value: string | undefined): string {
-	if (!value) return "";
-	try {
-		const url = new URL(value);
-		url.username = "";
-		url.password = "";
-		url.search = "";
-		url.hash = "";
-		return url.toString().replace(/\/+$/, "");
-	} catch {
-		return value.replace(/\/+$/, "");
-	}
-}
-
-function headerValue(headers: Record<string, string | null> | undefined, name: string): string | undefined {
-	const match = Object.entries(headers ?? {}).find(([key]) => key.toLowerCase() === name.toLowerCase());
-	return typeof match?.[1] === "string" && match[1] ? match[1] : undefined;
-}
-
-function codexAccountId(apiKey: string | undefined): string | undefined {
-	if (!apiKey) return undefined;
-	const parts = apiKey.split(".");
-	if (parts.length !== 3) return undefined;
-	try {
-		const payload = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"));
-		if (!isObject(payload)) return undefined;
-		const auth = payload["https://api.openai.com/auth"];
-		return isObject(auth) && typeof auth.chatgpt_account_id === "string" ? auth.chatgpt_account_id : undefined;
-	} catch {
-		return undefined;
-	}
-}
-
-function azureDeployment(modelId: string, env: Record<string, string> | undefined): string {
-	const raw = env?.AZURE_OPENAI_DEPLOYMENT_NAME_MAP;
-	if (!raw) return modelId;
-	for (const entry of raw.split(",")) {
-		const [candidate, deployment] = entry.split("=", 2).map((part) => part?.trim());
-		if (candidate === modelId && deployment) return deployment;
-	}
-	return modelId;
-}
-
-function routeIdentity(
-	model: Model<any>,
-	auth: { apiKey?: string; headers?: Record<string, string | null>; baseUrl?: string; env?: Record<string, string> },
-): NativeIdentity {
+function identity(model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions): NativeIdentity {
 	const azure = model.api === "azure-openai-responses";
+	const azureBase = options.env?.AZURE_OPENAI_BASE_URL || (options.env?.AZURE_OPENAI_RESOURCE_NAME ? `https://${options.env.AZURE_OPENAI_RESOURCE_NAME}.openai.azure.com/openai/v1` : undefined);
+	const url = new URL(azure ? azureBase ?? model.baseUrl : model.baseUrl);
+	url.username = ""; url.password = ""; url.search = ""; url.hash = "";
+	let accountId = header(options.headers, "chatgpt-account-id");
+	if (!accountId && model.api === "openai-codex-responses" && options.apiKey) {
+		try {
+			const token = JSON.parse(Buffer.from(options.apiKey.split(".")[1]!, "base64url").toString("utf8"));
+			const id = token["https://api.openai.com/auth"]?.chatgpt_account_id;
+			if (typeof id === "string") accountId = id;
+		} catch { /* A malformed credential is left to the provider, never persisted. */ }
+	}
+	const map = options.env?.AZURE_OPENAI_DEPLOYMENT_NAME_MAP?.split(",").map((entry) => entry.split("=").map((part) => part.trim()));
 	return {
-		endpoint: normalizedEndpoint(auth.baseUrl ?? auth.env?.AZURE_OPENAI_BASE_URL ?? model.baseUrl),
-		organization: headerValue(auth.headers, "openai-organization"),
-		project: headerValue(auth.headers, "openai-project"),
-		accountId: model.api === "openai-codex-responses" ? codexAccountId(auth.apiKey) : undefined,
-		azureApiVersion: azure ? (auth.env?.AZURE_OPENAI_API_VERSION || "v1") : undefined,
-		azureDeployment: azure ? azureDeployment(model.id, auth.env) : undefined,
+		endpoint: url.toString().replace(/\/+$/, ""),
+		organization: header(options.headers, "openai-organization"),
+		project: header(options.headers, "openai-project"),
+		accountId,
+		azureApiVersion: azure ? options.env?.AZURE_OPENAI_API_VERSION ?? "v1" : undefined,
+		azureDeployment: azure ? map?.find(([id]) => id === model.id)?.[1] ?? model.id : undefined,
 	};
 }
-
-function providerContext(messages: AgentMessage[]): TranscriptContext {
-	// The canonical projection already carries the system prompt and tool loadout as
-	// transcript system messages; folding another system message in front would
-	// duplicate the prompt and its tool declarations.
-	return normalizeContext({ messages: convertToLlm(messages) });
-}
-
 function combineUsage(first: Usage | undefined, second: Usage | undefined): Usage | undefined {
 	if (!first) return second;
 	if (!second) return first;
-	return {
-		input: first.input + second.input,
-		output: first.output + second.output,
-		cacheRead: first.cacheRead + second.cacheRead,
-		cacheWrite: first.cacheWrite + second.cacheWrite,
-		cacheWrite1h: first.cacheWrite1h !== undefined || second.cacheWrite1h !== undefined ? (first.cacheWrite1h ?? 0) + (second.cacheWrite1h ?? 0) : undefined,
-		reasoning: first.reasoning !== undefined || second.reasoning !== undefined ? (first.reasoning ?? 0) + (second.reasoning ?? 0) : undefined,
-		totalTokens: first.totalTokens + second.totalTokens,
-		cost: {
-			input: first.cost.input + second.cost.input,
-			output: first.cost.output + second.cost.output,
-			cacheRead: first.cost.cacheRead + second.cost.cacheRead,
-			cacheWrite: first.cost.cacheWrite + second.cost.cacheWrite,
-			total: first.cost.total + second.cost.total,
-		},
-	};
+	const result = structuredClone(first);
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) result[key] += second[key];
+	for (const key of ["reasoning", "cacheWrite1h"] as const) if (first[key] !== undefined || second[key] !== undefined) result[key] = (first[key] ?? 0) + (second[key] ?? 0);
+	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) result.cost[key] += second.cost[key];
+	return result;
 }
 
-async function nativeAndPortableCompaction(
-	pi: ExtensionAPI,
-	event: SessionBeforeCompactEvent,
-	ctx: ExtensionContext,
-) {
-	const model = ctx.model;
-	const protocol = resolveNativeProtocol(model);
-	if (!model || !protocol || genericCompactionSelected(pi, ctx)) return undefined;
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-	if (!auth.ok) return undefined;
-	const provider = ctx.modelRegistry.getProvider(model.provider);
-	if (!provider) return undefined;
-	const identity = routeIdentity(model, auth);
-	// Apply the auth-resolved endpoint the way `ModelRegistry.stream()` would; raw
-	// provider dispatch otherwise ignores a provider-owned base URL override.
-	const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
-	const projection = ctx.sessionManager.buildSessionProjection();
-	const previous = findLatestNativeCompaction(event.branchEntries, model, identity);
-	const input = nativeRequestInput(model, projection.entries, event.branchEntries, previous, leadingSystemMessage(projection.messages));
-	const native = await requestProviderCompaction({
-		provider,
-		model: requestModel,
-		context: providerContext(projection.messages),
-		input,
-		protocol,
-		apiKey: auth.apiKey,
-		headers: auth.headers,
-		env: auth.env,
-		signal: event.signal,
-	});
-	const portable = await compact(
-		event.preparation,
-		requestModel,
-		auth.apiKey,
-		// `compact` narrows headers to strings, but Pi's provider pipeline reads the
-		// same record and treats `null` as a deletion.
-		auth.headers as Record<string, string> | undefined,
-		event.customInstructions,
-		event.signal,
-		ctx.thinkingLevel,
-		provider.streamSimple.bind(provider),
-		auth.env,
-		undefined,
-		undefined,
-		ctx.sessionManager.getSessionId(),
-	);
-	const portableDetails = isObject(portable.details) ? portable.details : {};
-	const details: NativeCompactionDetails = {
-		type: NATIVE_COMPACTION_TYPE,
-		version: NATIVE_COMPACTION_VERSION,
-		provider: model.provider,
-		api: model.api,
-		model: model.id,
-		protocol,
-		identity,
-		output: native.output,
-		nativeUsage: native.usage,
-		portableUsage: portable.usage,
-		readFiles: Array.isArray(portableDetails.readFiles) ? portableDetails.readFiles.filter((item): item is string => typeof item === "string") : undefined,
-		modifiedFiles: Array.isArray(portableDetails.modifiedFiles) ? portableDetails.modifiedFiles.filter((item): item is string => typeof item === "string") : undefined,
-	};
-	return {
-		compaction: {
-			...portable,
-			usage: combineUsage(native.usage, portable.usage),
-			details,
-		},
-	};
+function supportedRouteOptions(model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions): boolean {
+	if (model.api !== "azure-openai-responses") return true;
+	const extra = options as ProviderStreamOptions;
+	if (["azureBaseUrl", "azureResourceName", "azureApiVersion", "azureDeploymentName"].some((key) => extra[key] !== undefined)) return false;
+	return !["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME", "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP"].some((key) => process.env[key] !== undefined && options.env?.[key] === undefined);
+}
+
+interface Captured {
+	prepared: PreparedRequest;
+	model: Model<any>;
+	provider: Provider;
+	options: ProviderStreamOptions | SimpleStreamOptions;
+	branchLength: number;
+	branchHash: string;
+	routeHash: string;
+	authHash: string;
+	policyHash: string;
+	sessionId: string;
+}
+interface Active {
+	entryId: string;
+	detailsHash: string;
+	summary: string;
+	branchLength: number;
+	branchHash: string;
+	routeHash: string;
+	policyHash: string;
 }
 
 export default function (pi: ExtensionAPI): void {
-	pi.on("before_provider_request", async (event, ctx) => {
-		const model = ctx.model;
-		if (!supportsNativeCompaction(model)) return;
-		const branch = ctx.sessionManager.getBranch();
-		const candidate = findLatestNativeCompaction(branch, model);
-		if (!candidate || genericCompactionSelected(pi, ctx)) return;
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-		if (!auth.ok) return;
-		const latest = findLatestNativeCompaction(branch, model, routeIdentity(model, auth));
-		if (!latest) return;
-		const projection = ctx.sessionManager.buildSessionProjection();
-		const after = idsAfter(branch, latest.entryId);
-		const postItems = after ? projectedAfter(model, projection.entries, after, leadingSystemMessage(projection.messages)) : [];
-		const rewritten = rewriteResponsesPayload(event.payload, latest, postItems);
-		if (rewritten === event.payload || !isObject(rewritten)) return rewritten;
-		return rewritten;
-	});
+	// Evidence is deliberately process/session-local. A reload cannot prove unchanged
+	// hook/privacy policy, even if the visible summary text happens to match.
+	const secret = randomBytes(32);
+	const routeDigest = (value: unknown) => createHmac("sha256", secret).update(JSON.stringify(value)).digest("hex");
+	let runtimeId = randomUUID();
+	let ctx: ExtensionContext | undefined;
+	let snapshot: Captured | undefined;
+	let active: Active | undefined;
+	let pending: { details: NativeCompactionDetails; capture: Captured; summary: string } | undefined;
+	let uninstall: (() => void) | undefined;
+	let installedProvider: string | undefined;
+	let generation = 0;
+	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; active = undefined; pending = undefined; };
+	const generic = (context: ExtensionContext) => resolveCompactionModelPolicy(pi, context).hasSelectors;
+	const route = (model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions) => routeDigest({ model, apiKey: options.apiKey, headers: options.headers, env: options.env });
+	const unchanged = (branch: readonly SessionEntry[], length: number, hash: string) => branch.length >= length && digest(branch.slice(0, length)) === hash && !branch.slice(length).some((entry) => entry.type === "context_edit");
 
-	pi.on("session_before_compact", async (event, ctx) => {
+	const observe: ObserveRequest = (model, context, options) => {
+		const owner = ctx;
+		if (!owner || !supportsNativeCompaction(model) || !options.onPayload || options.sessionId !== owner.sessionManager.getSessionId() || generic(owner)) return;
+		// The Azure adapter also accepts API-specific overrides and process-env
+		// fallbacks. Those must not silently select a route absent from our evidence.
+		if (!supportedRouteOptions(model, options)) return;
+		const ticket = generation;
+		const branch = owner.sessionManager.getBranch();
+		const branchHash = digest(branch);
+		const canonical = transcript(owner.sessionManager.buildSessionProjection().messages);
+		const current = () => generation === ticket && ctx === owner && !options.signal?.aborted && supportedRouteOptions(model, options) && digest(owner.sessionManager.getBranch()) === branchHash;
+		return async (payload) => {
+			if (!current()) return payload;
+			snapshot = undefined;
+			const prepared = capturePreparedRequest(model, context, canonical, payload);
+			if (!prepared) { active = undefined; return payload; }
+			const auth = await owner.modelRegistry.getApiKeyAndHeaders(model);
+			if (!current()) return payload;
+			// A registry lookup after payload hooks must describe the credentials used by
+			// THIS request, not a newly rotated account. Header/env rewrites without an
+			// exact auth correspondence are deliberately ineligible.
+			const normalizedHeaders = (headers: ProviderHeaders | undefined) => Object.entries(headers ?? {}).map(([name, value]) => [name.toLowerCase(), value]).sort(([a], [b]) => String(a).localeCompare(String(b)));
+			if (!auth.ok || generic(owner) || auth.apiKey !== options.apiKey || (auth.baseUrl ?? model.baseUrl) !== model.baseUrl || !equal(normalizedHeaders(auth.headers), normalizedHeaders(options.headers)) || !equal(auth.env ?? {}, options.env ?? {})) {
+				active = undefined;
+				return payload;
+			}
+			const provider = owner.modelRegistry.getProvider(model.provider);
+			if (!provider) return payload;
+			const routeHash = route(model, options);
+			const policyHash = digest(requestPolicy(model, prepared));
+			const latest = latestCompaction(branch);
+			let result = payload;
+			if (active && latest?.id === active.entryId && latest.summary === active.summary && digest(latest.details) === active.detailsHash && unchanged(branch, active.branchLength, active.branchHash) && active.routeHash === routeHash && active.policyHash === policyHash) {
+				const details = readNativeCompactionDetails(latest.details);
+				const projection = owner.sessionManager.buildSessionProjection();
+				const contribution = projection.entries.find((entry) => entry.sourceEntry.id === latest.id);
+				const prefix = contribution ? transcript(contribution.messages) : undefined;
+				const slot = prefix ? summarySlot(model, prepared, prefix) : undefined;
+				if (details?.version === 3 && details.coverage?.runtimeId === runtimeId && details.coverage.firstKeptEntryId === latest.firstKeptEntryId && slot !== undefined) {
+					const replaced = substituteSummary(payload, slot, prepared.portableInput[slot]!, details.output);
+					if (replaced) {
+						result = replaced;
+						prepared.payload = structuredClone(replaced);
+						prepared.replacement = { index: slot, count: details.output.length };
+					} else active = undefined;
+				} else active = undefined;
+			} else active = undefined;
+			snapshot = {
+				prepared, model: structuredClone(model), provider,
+				options: { apiKey: options.apiKey, headers: structuredClone(options.headers), env: structuredClone(options.env), fetch: options.fetch },
+				branchLength: branch.length, branchHash, routeHash, authHash: routeDigest(auth), policyHash,
+				sessionId: owner.sessionManager.getSessionId(),
+			};
+			return result;
+		};
+	};
+
+	const install = (context: ExtensionContext) => {
+		ctx = context;
+		if (installedProvider === context.model?.provider) return;
+		uninstall?.(); uninstall = undefined; installedProvider = undefined;
+		if (!supportsNativeCompaction(context.model)) return;
+		uninstall = installObserver(pi, context, observe);
+		if (uninstall) installedProvider = context.model.provider;
+	};
+	pi.on("session_start", (_event, context) => {
+		invalidate(); install(context);
+		const latest = latestCompaction(context.sessionManager.getBranch());
+		if (latest?.summary === NATIVE_COMPACTION_SUMMARY) context.ui.notify("Legacy native compaction has no portable summary. Native replay is disabled; recover from earlier history or start a new session.", "warning");
+	});
+	pi.on("before_agent_start", (_event, context) => { install(context); });
+	pi.on("model_select", (_event, context) => { invalidate(); install(context); });
+	pi.on("session_tree", () => { invalidate(); });
+	pi.on("session_shutdown", () => { invalidate(); uninstall?.(); uninstall = undefined; installedProvider = undefined; ctx = undefined; });
+	// Privacy-policy owners must invalidate before changing a policy that can affect
+	// hidden covered history. Arbitrary dynamic privacy compositions are unsupported.
+	const removeInvalidation = pi.events.on("pi-provider-compaction:invalidate", invalidate);
+	pi.on("session_shutdown", () => { if (typeof removeInvalidation === "function") removeInvalidation(); });
+
+	pi.on("session_before_compact", async (event, context) => {
+		const capture = snapshot;
+		snapshot = undefined; pending = undefined;
+		if (!capture || !context.model || generic(context) || event.signal.aborted) return;
+		const protocol = resolveNativeProtocol(context.model);
+		if (!protocol || context.sessionManager.getSessionId() !== capture.sessionId) return;
+		const ticket = generation;
+		const branch = context.sessionManager.getBranch();
+		const branchHash = digest(branch);
+		if (!equal(branch, event.branchEntries) || !unchanged(branch, capture.branchLength, capture.branchHash)) return;
+		const projection = context.sessionManager.buildSessionProjection();
+		const boundary = projection.entries.findIndex((entry) => entry.sourceEntry.id === event.preparation.firstKeptEntryId);
+		if (boundary < 0) return;
+		const prefix = transcript(projection.entries.slice(0, boundary).flatMap((entry) => entry.messages));
+		const input = selectCoveredPrefix(capture.model, capture.prepared, prefix);
+		if (!input) return;
+		const current = () => ticket === generation && !event.signal.aborted && supportedRouteOptions(capture.model, capture.options) && !generic(context) && context.modelRegistry.getProvider(capture.model.provider) === capture.provider && digest(context.sessionManager.getBranch()) === branchHash;
+		const auth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
+		if (!current()) return { cancel: true };
+		if (!auth.ok || routeDigest(auth) !== capture.authHash) return;
+		let portable: Awaited<ReturnType<typeof compact>>;
 		try {
-			return await nativeAndPortableCompaction(pi, event, ctx);
-		} catch (error) {
-			if (event.signal.aborted || (error instanceof Error && error.name === "AbortError")) return undefined;
-			console.error(`[pi-provider-compaction] native compaction failed: ${error instanceof Error ? error.message : String(error)}`);
-			return undefined;
+			portable = await compact(event.preparation, capture.model, auth.apiKey, auth.headers as Record<string, string> | undefined, event.customInstructions, event.signal, context.thinkingLevel, capture.provider.streamSimple.bind(capture.provider), auth.env, undefined, undefined, capture.sessionId);
+		} catch {
+			// No result exists to return; let Pi own its ordinary failure/fallback behavior.
+			return !current() ? { cancel: true } : undefined;
+		}
+		if (!current() || !portable.summary.trim() || portable.summary === NATIVE_COMPACTION_SUMMARY) return { cancel: true };
+		try {
+			const freshAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
+			if (!current()) return { cancel: true };
+			if (!freshAuth.ok || routeDigest(freshAuth) !== capture.authHash) return { compaction: portable };
+			const native = await requestProviderCompaction({
+				provider: capture.provider, model: capture.model, context: capture.prepared.context,
+				input, preparedPayload: capture.prepared.payload, protocol,
+				apiKey: capture.options.apiKey, headers: capture.options.headers, env: capture.options.env,
+				signal: event.signal, fetch: capture.options.fetch,
+			});
+			if (!current()) return { cancel: true };
+			const finalAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
+			if (!current()) return { cancel: true };
+			if (!finalAuth.ok || routeDigest(finalAuth) !== capture.authHash) return { compaction: portable };
+			const details: NativeCompactionDetails = {
+				...(isObject(portable.details) ? portable.details : {}),
+				type: NATIVE_COMPACTION_TYPE, version: 3, provider: capture.model.provider, api: capture.model.api, model: capture.model.id,
+				protocol, identity: identity(capture.model, capture.options), output: native.output,
+				nativeUsage: native.usage, portableUsage: portable.usage,
+				coverage: { kind: "summarized-prefix", firstKeptEntryId: portable.firstKeptEntryId, sourceLeafId: branch.at(-1)!.id, sourceHash: branchHash, policyHash: capture.policyHash, inputHash: digest(input), runtimeId },
+			};
+			pending = { details, capture, summary: portable.summary };
+			return { compaction: { ...portable, usage: combineUsage(native.usage, portable.usage), details } };
+		} catch {
+			if (!current()) return { cancel: true };
+			// The portable request already succeeded. Never pay for a duplicate summary.
+			return { compaction: portable };
 		}
 	});
+	pi.on("session_compact", (event, context) => {
+		active = undefined; snapshot = undefined;
+		const candidate = pending; pending = undefined;
+		if (!candidate || !equal(event.compactionEntry.details, candidate.details) || event.compactionEntry.summary !== candidate.summary) return;
+		const branch = context.sessionManager.getBranch();
+		const coverage = candidate.details.coverage;
+		if (!coverage || event.compactionEntry.firstKeptEntryId !== coverage.firstKeptEntryId || event.compactionEntry.parentId !== coverage.sourceLeafId || branch.at(-1)?.id !== event.compactionEntry.id || digest(branch.slice(0, -1)) !== coverage.sourceHash) return;
+		active = { entryId: event.compactionEntry.id, detailsHash: digest(candidate.details), summary: candidate.summary, branchLength: branch.length, branchHash: digest(branch), routeHash: candidate.capture.routeHash, policyHash: candidate.capture.policyHash };
+	});
+	pi.on("session_compact_failed", () => { pending = undefined; snapshot = undefined; });
 }
