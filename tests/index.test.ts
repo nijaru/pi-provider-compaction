@@ -274,6 +274,20 @@ describe("persistence and replay", () => {
 			input: [kept, checkpoint, after],
 		});
 	});
+
+	test("drops compacted history when nothing follows the compaction", () => {
+		const retained = { role: "user", content: [{ type: "input_text", text: "RETAINED_ONE" }] } as ResponseItem;
+		const native = details({ output: [retained, checkpoint] });
+		const compacted = { role: "user", content: [{ type: "input_text", text: "TOOL_RESULT_ONE" }] } as ResponseItem;
+		const prompt = { role: "developer", content: "PROMPT" } as ResponseItem;
+		const payload = { model: directModel.id, input: [prompt, retained, compacted] };
+
+		// Nothing is chronologically after the compaction, so only the native output survives.
+		expect(rewriteResponsesPayload(payload, native, [])).toEqual({
+			model: directModel.id,
+			input: [prompt, retained, checkpoint],
+		});
+	});
 });
 
 describe("legacy direct helper", () => {

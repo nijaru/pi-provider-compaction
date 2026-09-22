@@ -277,35 +277,6 @@ function nestedNumber(value: unknown, key: string): number {
 	return isObject(value) ? readNumber(value[key]) : 0;
 }
 
-function stableStringify(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-	if (isObject(value)) {
-		return `{${Object.keys(value).sort().map((key) => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(",")}}`;
-	}
-	return JSON.stringify(value) ?? "null";
-}
-
-function itemMatches(left: ResponseItem, right: ResponseItem): boolean {
-	const leftId = typeof left.id === "string" ? left.id : undefined;
-	const rightId = typeof right.id === "string" ? right.id : undefined;
-	if (leftId && rightId) return leftId === rightId;
-	const leftCallId = typeof left.call_id === "string" ? left.call_id : undefined;
-	const rightCallId = typeof right.call_id === "string" ? right.call_id : undefined;
-	if (leftCallId && rightCallId) return leftCallId === rightCallId && left.type === right.type;
-	if (left.type === "message" && right.type === "message") {
-		return left.role === right.role && stableStringify(left.content) === stableStringify(right.content);
-	}
-	return stableStringify(left) === stableStringify(right);
-}
-
-function findLastSubsequence(items: ResponseItem[], sequence: ResponseItem[]): number {
-	if (sequence.length === 0) return -1;
-	for (let start = items.length - sequence.length; start >= 0; start--) {
-		if (sequence.every((item, offset) => itemMatches(items[start + offset], item))) return start;
-	}
-	return -1;
-}
-
 /**
  * Leading system/developer items are the serialized prompt (Pi's Responses API keeps
  * the prompt in `input`, not `instructions`). Replacing `input` must keep them.
@@ -328,15 +299,18 @@ export function rewriteResponsesPayload(
 	if (!isObject(payload) || !Array.isArray(payload.input)) return payload;
 	const currentInput = payload.input.filter(isObject) as ResponseItem[];
 	if (currentInput.length !== payload.input.length) return payload;
-	const leading = structuredClone(leadingPromptItems(currentInput));
-	const postStart = findLastSubsequence(currentInput, postCompactionItems);
-	if (postStart >= 0) return { ...payload, input: [...leading, ...structuredClone(details.output), ...currentInput.slice(postStart)] };
-	const retainedOutput = details.output.filter((item) => item.type !== "compaction");
-	const retainedStart = findLastSubsequence(currentInput, retainedOutput);
-	if (retainedStart >= 0) {
-		return { ...payload, input: [...leading, ...structuredClone(details.output), ...currentInput.slice(retainedStart + retainedOutput.length)] };
-	}
-	return { ...payload, input: [...leading, ...structuredClone(details.output), ...structuredClone(postCompactionItems)] };
+	// The native output replaces the whole compacted prefix, and `postCompactionItems`
+	// is everything chronologically after the compaction. Splicing the current input by
+	// subsequence match re-appended already-compacted retained history whenever the
+	// post-compaction sequence was empty.
+	return {
+		...payload,
+		input: [
+			...structuredClone(leadingPromptItems(currentInput)),
+			...structuredClone(details.output),
+			...structuredClone(postCompactionItems),
+		],
+	};
 }
 
 function genericCompactionSelected(
