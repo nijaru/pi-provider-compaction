@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { getCurrentSystemPrompt, getCurrentTools, normalizeContext } from "@earendil-works/pi-ai";
+import { getCurrentSystemPrompt, normalizeContext } from "@earendil-works/pi-ai";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import type { SessionEntry } from "@earendil-works/pi-coding-agent";
 import extension from "../index";
@@ -318,9 +318,9 @@ describe("legacy direct helper", () => {
 
 describe("extension dispatch context", () => {
 	// Pi 0.86+ providers read the prompt and tool declarations from the transcript's
-	// system messages, not from `Context.systemPrompt`/`Context.tools`. Dispatching an
-	// un-normalized `Context` silently dropped both.
-	test("normalizes the request context so providers recover the prompt and tools", async () => {
+	// system messages. The canonical projection already carries them, so folding the
+	// base prompt in front would duplicate it.
+	test("dispatches the canonical projection without duplicating the system prompt", async () => {
 		const handlers = new Map<string, (event: any, ctx: any) => unknown>();
 		const pi = {
 			on(name: string, handler: (event: any, ctx: any) => unknown) {
@@ -340,15 +340,15 @@ describe("extension dispatch context", () => {
 				throw new Error("captured dispatch context");
 			},
 		};
+		const systemMessage = { role: "system", content: [{ type: "text", text: "PROJECTION PROMPT" }], timestamp: 1 };
 		const ctx = {
 			cwd: "/tmp",
 			isProjectTrusted: () => false,
 			model: directModel,
 			thinkingLevel: undefined,
-			getSystemPrompt: () => "SYSTEM PROMPT",
+			getSystemPrompt: () => "BASE SYSTEM PROMPT",
 			sessionManager: {
-				buildSessionProjection: () => ({ entries: [], messages: [], thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
-				buildContextEntries: () => [],
+				buildSessionProjection: () => ({ entries: [], messages: [systemMessage], thinkingLevel: "high", model: { provider: "openai", modelId: "gpt-test" } }),
 				getSessionId: () => "session-1",
 			},
 			modelRegistry: {
@@ -368,9 +368,9 @@ describe("extension dispatch context", () => {
 
 		expect(captured).toHaveLength(1);
 		const messages = captured[0].messages as Array<{ role: string }>;
-		expect(messages[0]?.role).toBe("system");
-		expect(getCurrentSystemPrompt(messages)).toContain("SYSTEM PROMPT");
-		expect(getCurrentTools(messages).map((tool) => tool.name)).toEqual(["read"]);
+		expect(messages.filter((message) => message.role === "system")).toHaveLength(1);
+		expect(getCurrentSystemPrompt(messages)).toContain("PROJECTION PROMPT");
+		expect(getCurrentSystemPrompt(messages)).not.toContain("BASE SYSTEM PROMPT");
 	});
 });
 
@@ -481,10 +481,10 @@ describe("canonical projection and payload ownership", () => {
 		expect(result.instructions).toBe("PER_REQUEST_OVERRIDE");
 	});
 
-	test("replay supplies the system prompt only when the payload has none", async () => {
+	test("replay preserves the serialized prompt and never synthesizes instructions", async () => {
 		const keptMessage = { role: "user", content: [{ type: "text", text: "KEPT_CONTENT" }], timestamp: 1 };
 		const keptEntry = { type: "message", id: "m1", parentId: "c1", timestamp: "t2", message: keptMessage } as SessionEntry;
-		const native = compactionEntry(details({ output: [checkpoint, { type: "message", role: "assistant", content: [] }] }));
+		const native = compactionEntry(details({ output: [checkpoint] }));
 
 		// `before_provider_request` rewrites the payload and never dispatches a stream.
 		const provider = {} as any;
@@ -500,9 +500,60 @@ describe("canonical projection and payload ownership", () => {
 			},
 		};
 
-		const payload = { model: "gpt-test", input: [{ type: "message", role: "user", content: "kept" }] };
+		// The Responses API carries the prompt in `input`; a context_with_system
+		// transformation must survive, and ctx.getSystemPrompt() must not be injected.
+		const payload = { model: "gpt-test", input: [{ role: "developer", content: "TRANSFORMED_PROMPT" }, { type: "message", role: "user", content: "kept" }] };
 		const result: any = await handlers.get("before_provider_request")!({ type: "before_provider_request", payload }, ctx);
-		expect(result.instructions).toBe("BASE_SYSTEM_PROMPT");
+		expect(result.instructions).toBeUndefined();
+		expect(JSON.stringify(result.input[0])).toContain("TRANSFORMED_PROMPT");
+	});
+
+	test("replay does not duplicate retained pre-compaction messages", async () => {
+		const retainedMessage = { role: "user", content: [{ type: "text", text: "RETAINED_ONE" }], timestamp: 1 };
+		const newMessage = { role: "user", content: [{ type: "text", text: "NEW_ONE" }], timestamp: 3 };
+		const retainedEntry = { type: "message", id: "m1", parentId: null, timestamp: "t1", message: retainedMessage } as SessionEntry;
+		const native = compactionEntry(details({ output: [retainedMessage, checkpoint] }));
+		const newEntry = { type: "message", id: "m3", parentId: "c1", timestamp: "t3", message: newMessage } as SessionEntry;
+
+		const provider = {} as any;
+		const { handlers, api } = makePi();
+		(extension as any)(api);
+		const base = projectionContext([], [], { provider });
+		const ctx = {
+			...base,
+			sessionManager: {
+				...base.sessionManager,
+				// Raw order: the retained entry came before the compaction.
+				getBranch: () => [retainedEntry, native, newEntry],
+				// Projection order: newest compaction, then retained entries, then new.
+				buildSessionProjection: () => ({
+					entries: [
+						{ sourceEntry: native, messages: [] },
+						{ sourceEntry: retainedEntry, messages: [retainedMessage] },
+						{ sourceEntry: newEntry, messages: [newMessage] },
+					],
+					messages: [retainedMessage, newMessage],
+					thinkingLevel: "high",
+					model: { provider: "openai", modelId: "gpt-test" },
+				}),
+			},
+		};
+
+		const payload = {
+			model: "gpt-test",
+			input: [
+				{ role: "developer", content: "PROMPT" },
+				{ role: "user", content: [{ type: "input_text", text: "RETAINED_ONE" }] },
+				{ role: "user", content: [{ type: "input_text", text: "NEW_ONE" }] },
+			],
+		};
+		const result: any = await handlers.get("before_provider_request")!({ type: "before_provider_request", payload }, ctx);
+
+		const serialized = JSON.stringify(result.input);
+		// The native output already carries the retained message; post items must not repeat it.
+		expect(serialized.split("RETAINED_ONE").length - 1).toBe(1);
+		expect(serialized).toContain("NEW_ONE");
+		expect(JSON.stringify(result.input[0])).toContain("PROMPT");
 	});
 });
 

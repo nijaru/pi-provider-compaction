@@ -1,7 +1,7 @@
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
 import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-responses-shared";
 import { calculateCost, normalizeContext } from "@earendil-works/pi-ai";
-import type { Model, Tool, TranscriptContext, Usage } from "@earendil-works/pi-ai";
+import type { Model, TranscriptContext, Usage } from "@earendil-works/pi-ai";
 import type {
 	ExtensionAPI,
 	ExtensionContext,
@@ -167,20 +167,32 @@ function projectedResponseItems(model: Model<any>, entries: ProjectedEntries): R
 	return responseItemsFromMessages(model, entries.flatMap((entry) => entry.messages));
 }
 
+/** Raw-order entry ids after `entryId`; undefined when the entry is not on the branch. */
+function idsAfter(branch: readonly SessionEntry[], entryId: string): ReadonlySet<string> | undefined {
+	const index = branch.findIndex((entry) => entry.id === entryId);
+	return index >= 0 ? new Set(branch.slice(index + 1).map((entry) => entry.id)) : undefined;
+}
+
+/** Projected (context_edit-applied) messages for entries chronologically after the boundary. */
+function projectedAfter(model: Model<any>, entries: ProjectedEntries, afterIds: ReadonlySet<string>): ResponseItem[] {
+	return projectedResponseItems(model, entries.filter((entry) => afterIds.has(entry.sourceEntry.id)));
+}
+
 function nativeRequestInput(
 	model: Model<any>,
 	projected: ProjectedEntries,
+	branch: readonly SessionEntry[],
 	previous: NativeCompactionState | undefined,
 ): ResponseItem[] {
+	// `buildContextEntries()` orders newest compaction, then retained pre-compaction
+	// entries, then new entries, so slicing the projection after the compaction would
+	// replay the retained history twice. The chronological boundary comes from the raw
+	// branch; message content still comes from the canonical projection so context_edit
+	// omissions and replacements apply.
 	if (previous) {
-		const previousIndex = projected.findIndex((entry) => entry.sourceEntry.id === previous.entryId);
-		if (previousIndex >= 0) {
-			return [...structuredClone(previous.output), ...projectedResponseItems(model, projected.slice(previousIndex + 1))];
-		}
+		const after = idsAfter(branch, previous.entryId);
+		if (after) return [...structuredClone(previous.output), ...projectedAfter(model, projected, after)];
 	}
-	// `buildSessionProjection()` is the canonical edited projection: it applies
-	// context_edit omissions and replacements that raw session entries still carry,
-	// so a native compaction cannot resurrect context Pi no longer sends.
 	return projectedResponseItems(model, projected);
 }
 
@@ -294,6 +306,20 @@ function findLastSubsequence(items: ResponseItem[], sequence: ResponseItem[]): n
 	return -1;
 }
 
+/**
+ * Leading system/developer items are the serialized prompt (Pi's Responses API keeps
+ * the prompt in `input`, not `instructions`). Replacing `input` must keep them.
+ */
+function leadingPromptItems(items: readonly ResponseItem[]): ResponseItem[] {
+	const leading: ResponseItem[] = [];
+	for (const item of items) {
+		const role = typeof item.role === "string" ? item.role : undefined;
+		if (role === "system" || role === "developer") leading.push(item);
+		else break;
+	}
+	return leading;
+}
+
 export function rewriteResponsesPayload(
 	payload: unknown,
 	details: NativeCompactionDetails,
@@ -302,14 +328,15 @@ export function rewriteResponsesPayload(
 	if (!isObject(payload) || !Array.isArray(payload.input)) return payload;
 	const currentInput = payload.input.filter(isObject) as ResponseItem[];
 	if (currentInput.length !== payload.input.length) return payload;
+	const leading = structuredClone(leadingPromptItems(currentInput));
 	const postStart = findLastSubsequence(currentInput, postCompactionItems);
-	if (postStart >= 0) return { ...payload, input: [...structuredClone(details.output), ...currentInput.slice(postStart)] };
+	if (postStart >= 0) return { ...payload, input: [...leading, ...structuredClone(details.output), ...currentInput.slice(postStart)] };
 	const retainedOutput = details.output.filter((item) => item.type !== "compaction");
 	const retainedStart = findLastSubsequence(currentInput, retainedOutput);
 	if (retainedStart >= 0) {
-		return { ...payload, input: [...structuredClone(details.output), ...currentInput.slice(retainedStart + retainedOutput.length)] };
+		return { ...payload, input: [...leading, ...structuredClone(details.output), ...currentInput.slice(retainedStart + retainedOutput.length)] };
 	}
-	return { ...payload, input: [...structuredClone(details.output), ...structuredClone(postCompactionItems)] };
+	return { ...payload, input: [...leading, ...structuredClone(details.output), ...structuredClone(postCompactionItems)] };
 }
 
 function genericCompactionSelected(
@@ -377,22 +404,11 @@ function routeIdentity(
 	};
 }
 
-function activeTools(pi: ExtensionAPI): Tool[] {
-	const available = new Map(pi.getAllTools().map((tool) => [tool.name, tool]));
-	return pi.getActiveTools().flatMap((name) => {
-		const tool = available.get(name);
-		return tool ? [{ name: tool.name, description: tool.description, parameters: tool.parameters }] : [];
-	});
-}
-
-function providerContext(pi: ExtensionAPI, ctx: ExtensionContext, messages: AgentMessage[]): TranscriptContext {
-	// Providers read the prompt and tool declarations from the transcript's system
-	// messages, so fold the raw request context before dispatching to one.
-	return normalizeContext({
-		systemPrompt: ctx.getSystemPrompt(),
-		messages: convertToLlm(messages),
-		tools: activeTools(pi),
-	});
+function providerContext(messages: AgentMessage[]): TranscriptContext {
+	// The canonical projection already carries the system prompt and tool loadout as
+	// transcript system messages; folding another system message in front would
+	// duplicate the prompt and its tool declarations.
+	return normalizeContext({ messages: convertToLlm(messages) });
 }
 
 function combineUsage(first: Usage | undefined, second: Usage | undefined): Usage | undefined {
@@ -434,11 +450,11 @@ async function nativeAndPortableCompaction(
 	const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 	const projection = ctx.sessionManager.buildSessionProjection();
 	const previous = findLatestNativeCompaction(event.branchEntries, model, identity);
-	const input = nativeRequestInput(model, projection.entries, previous);
+	const input = nativeRequestInput(model, projection.entries, event.branchEntries, previous);
 	const native = await requestProviderCompaction({
 		provider,
 		model: requestModel,
-		context: providerContext(pi, ctx, projection.messages),
+		context: providerContext(projection.messages),
 		input,
 		protocol,
 		apiKey: auth.apiKey,
@@ -498,16 +514,11 @@ export default function (pi: ExtensionAPI): void {
 		const latest = findLatestNativeCompaction(branch, model, routeIdentity(model, auth));
 		if (!latest) return;
 		const projection = ctx.sessionManager.buildSessionProjection();
-		const index = projection.entries.findIndex((entry) => entry.sourceEntry.id === latest.entryId);
-		const postItems = index >= 0 ? projectedResponseItems(model, projection.entries.slice(index + 1)) : [];
+		const after = idsAfter(branch, latest.entryId);
+		const postItems = after ? projectedAfter(model, projection.entries, after) : [];
 		const rewritten = rewriteResponsesPayload(event.payload, latest, postItems);
 		if (rewritten === event.payload || !isObject(rewritten)) return rewritten;
-		// The provider already serialized the effective prompt, including any
-		// `context_with_system` transformation. Only supply one when the payload has none;
-		// `ctx.getSystemPrompt()` is not the final serialized request prompt.
-		if (typeof rewritten.instructions === "string" && rewritten.instructions.length > 0) return rewritten;
-		const systemPrompt = ctx.getSystemPrompt();
-		return systemPrompt ? { ...rewritten, instructions: systemPrompt } : rewritten;
+		return rewritten;
 	});
 
 	pi.on("session_before_compact", async (event, ctx) => {

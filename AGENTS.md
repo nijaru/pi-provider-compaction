@@ -14,6 +14,8 @@ Provider-native compaction adapters for Pi.
 ## Protocol rules
 
 - Pass resolved `ProviderHeaders` through to summary and transport requests unchanged. `null` deletes a provider default header; filtering it out restores the header the auth config disabled.
+- Native request input and replay take message *content* from Pi's canonical `buildSessionProjection()` (so `context_edit` omissions and replacements apply), but select the post-compaction *boundary* from raw branch order. The projection lists the newest compaction first, then retained pre-compaction entries, so slicing the projection replays retained history twice.
+- The Responses API carries the prompt in the leading `system`/`developer` input item, not `instructions`. Replay preserves that item; never synthesize `instructions` from `ctx.getSystemPrompt()`, which omits `context_with_system` transformations.
 - Native request input and replay must follow Pi's canonical `buildSessionProjection()`, never raw entries. `context_edit` omissions and replacements are invisible to `buildContextEntries()` and `sessionEntryToContextMessages()`, so a raw rebuild resurrects context Pi no longer sends.
 - Use Pi's active provider transport to obtain the real request URL, authentication, deployment/version semantics, and provider request shape.
 - Standalone Responses compaction preserves the full canonical returned output window. Validate size and checkpoint structure; do not prune it.
