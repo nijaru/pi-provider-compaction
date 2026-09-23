@@ -245,6 +245,23 @@ describe("Pi 0.87 runner + real Responses adapter", () => {
 			expect(JSON.stringify(f.requests.at(-1)!.body.input)).toContain("<summary>");
 		} finally { await f.close(); }
 	});
+	test("companion-extension custom entries neither block native compaction nor leak into requests", async () => {
+		const f = await fixture();
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			// pi-tps/herdr style state entries appear after capture and are message-less.
+			f.manager.appendCustomEntry("companion:metric", { tokens: 42 });
+			const result = await f.session.compact();
+			expect((result.details as any).version).toBe(3);
+			await f.session.prompt("C new");
+			const last = f.requests.at(-1)!.body.input;
+			expect(last).toContainEqual(checkpoint);
+			expect(JSON.stringify(last)).toContain("C new");
+			expect(JSON.stringify(last)).not.toContain("companion:metric");
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
 	test("native failure returns the already-produced portable summary without another request", async () => {
 		const f = await fixture({ nativeFailure: true });
 		try {
