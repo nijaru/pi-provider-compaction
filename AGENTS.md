@@ -1,6 +1,6 @@
 # pi-provider-compaction
 
-Experimental provider-native compaction for Pi 0.87.0. Keep global activation and publishing separate from development validation.
+Experimental provider-native compaction tested against Pi 1.0.2; the minimum runtime remains Pi 0.87.0. Keep global activation and publishing separate from development validation.
 
 ## Product boundaries
 
@@ -22,12 +22,12 @@ Experimental provider-native compaction for Pi 0.87.0. Keep global activation an
 
 ## Provider ownership
 
-- Pi 0.87.0 registration is replacement, not middleware. Decorate registered native **bases**, never effective composed providers; the latter loses legacy model headers and embeds stale configuration.
+- Pi provider registration is replacement, not middleware. Decorate registered native **bases**, never effective composed providers; the latter loses legacy model headers and embeds stale configuration.
 - Only decorate existing static legacy `streamSimple` owners. Preserve their callback receiver and all configuration. Exclude dynamic legacy catalogs/OAuth model projections and unregistered builtin overlays.
 - Restore registration only while still owning the slot. Preserve intervening unrelated configuration changes. Never change full-stream semantics just to obtain a capture hook.
 
 ## Development
 
-Use Bun/TypeScript. Dependencies pin the verified Pi 0.87.0 floor. `index.ts` owns lifecycle and compaction; `provider.ts` owns capture-hook installation; `replay.ts` owns exact mapping and substitution; `protocol.ts` owns transport/validation; `policy.ts` mirrors generic-model precedence.
+Use Bun/TypeScript. Development dependencies pin the tested Pi 1.0.2 host, not the minimum runtime floor. `index.ts` owns lifecycle and compaction; `provider.ts` owns capture-hook installation; `replay.ts` owns exact mapping and substitution; `protocol.ts` owns transport/validation; `policy.ts` mirrors generic-model precedence.
 
-Run `bun run check`, `bun run build`, and `git diff --check`. The manifest loads ignored `dist/index.js`, so rebuild before local Pi testing. Exercise real Pi runner/adapters with fake transports. Report authenticated backend tests separately; fixtures alone do not establish production readiness.
+Run `bun run check`, `bun run build`, and `git diff --check`. `check` rebuilds ignored `dist/index.js` before testing the artifact against the host serializer. The manifest loads that artifact, so rebuild after source or dependency changes before local Pi testing. Exercise real Pi runner/adapters with fake transports. Report authenticated backend tests separately; fixtures alone do not establish production readiness.

@@ -51,7 +51,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; nativeFail
 	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
 	if (options.fastFactory) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`, models: [model] });
 	else runtime.registerNativeProvider(provider);
-	const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 40, reserveTokens: 1000 }, cacheWarming: { enabled: false } } as any);
+	const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 40, reserveTokens: 1000 }, cacheWarming: "off" });
 	const manager = SessionManager.inMemory(directory);
 	const loader = new DefaultResourceLoader({ cwd: directory, agentDir: directory, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt: "Fixture policy", extensionFactories: [...(options.fastFactory ? [options.fastFactory] : []), extension, ...(options.hooks ? [options.hooks] : [])] });
 	await loader.reload();
@@ -61,7 +61,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; nativeFail
 	return { session, manager, requests, errors, runtime, provider, authControl, async close() { session.dispose(); await rm(directory, { recursive: true, force: true }); } };
 }
 
-describe("Pi 0.87 runner + real Responses adapter", () => {
+describe("Pi 1.0.2 runner + real Responses adapter", () => {
 	test.skipIf(!process.env.PI_FAST_MODE_FIXTURE_PATH)("installed pi-fast-mode composes with native compaction and survives reload", async () => {
 		// Pi's loader resolves host APIs for packages installed without peer deps.
 		// Give the installed source the same host bindings in this Bun fixture.
