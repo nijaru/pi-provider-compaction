@@ -1,6 +1,6 @@
 # pi-provider-compaction
 
-Experimental provider-native compaction tested against Pi 1.0.2; the minimum runtime remains Pi 0.87.0. Keep global activation and publishing separate from development validation.
+Experimental provider-native compaction tested against Pi 1.1.0; the minimum runtime remains Pi 0.87.0. Keep global activation and publishing separate from development validation.
 
 ## Product boundaries
 
@@ -28,6 +28,6 @@ Experimental provider-native compaction tested against Pi 1.0.2; the minimum run
 
 ## Development
 
-Use Bun/TypeScript. Development dependencies pin the tested Pi 1.0.2 host, not the minimum runtime floor. `index.ts` owns lifecycle and compaction; `provider.ts` owns capture-hook installation; `replay.ts` owns exact mapping and substitution; `protocol.ts` owns transport/validation; `policy.ts` mirrors generic-model precedence.
+Use Bun/TypeScript. Development dependencies pin the tested Pi 1.1.0 host, not the minimum runtime floor. `index.ts` owns lifecycle and compaction; `provider.ts` owns capture-hook installation; `replay.ts` owns exact mapping and substitution; `protocol.ts` owns transport/validation; `policy.ts` mirrors generic-model precedence.
 
 Run `bun run check`, `bun run build`, and `git diff --check`. `check` rebuilds ignored `dist/index.js` before testing the artifact against the host serializer. The manifest loads that artifact, so rebuild after source or dependency changes before local Pi testing. Exercise real Pi runner/adapters with fake transports. Report authenticated backend tests separately; fixtures alone do not establish production readiness.

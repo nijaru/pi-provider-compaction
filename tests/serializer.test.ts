@@ -10,7 +10,7 @@ const grammar: Tool = { name: "edit", description: "Edit", parameters: Type.Obje
 const strict: Tool = { name: "strict", description: "Strict", parameters: Type.Object({ text: Type.String() }), constrainedSampling: { type: "json_schema", strict: "prefer" } };
 for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-responses", azure], ["openai-codex-responses", codex]] as const) {
 	for (const mid of [false, true]) test(`${api}: real serializer parity for grammar/strict/IDs/images/tool changes (mid=${mid})`, async () => {
-		const model = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : api, id: "fixture", baseUrl: "https://fixture.invalid/v1", name: "Fixture", input: ["text", "image"], reasoning: true, contextWindow: 100000, maxTokens: 4096, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: mid, supportsAdditionalTools: mid } } as Model<any>;
+		const model = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : "azure", id: "fixture", baseUrl: "https://fixture.invalid/v1", name: "Fixture", input: ["text", "image"], reasoning: true, contextWindow: 100000, maxTokens: 4096, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: mid, supportsAdditionalTools: mid } } as Model<any>;
 		const context = normalizeContext({ messages: [
 			{ role: "system", content: "forced policy", toolsAdded: [grammar, strict], timestamp: 1 },
 			{ role: "user", content: "A", timestamp: 2 },

@@ -61,7 +61,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; nativeFail
 	return { session, manager, requests, errors, runtime, provider, authControl, async close() { session.dispose(); await rm(directory, { recursive: true, force: true }); } };
 }
 
-describe("Pi 1.0.2 runner + real Responses adapter", () => {
+describe("Pi runner + real Responses adapter", () => {
 	test.skipIf(!process.env.PI_FAST_MODE_FIXTURE_PATH)("installed pi-fast-mode composes with native compaction and survives reload", async () => {
 		// Pi's loader resolves host APIs for packages installed without peer deps.
 		// Give the installed source the same host bindings in this Bun fixture.

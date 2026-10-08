@@ -5,6 +5,7 @@ import { convertResponsesMessages } from "@earendil-works/pi-ai/api/openai-respo
 import { isObject, type JsonObject, type ResponseItem } from "./protocol";
 
 const TOOL_CALL_PROVIDERS = new Set(["openai", "openai-codex", "opencode"]);
+const AZURE_TOOL_CALL_PROVIDERS = new Set([...TOOL_CALL_PROVIDERS, "azure"]);
 export const MAX_SNAPSHOT_BYTES = 8 * 1024 * 1024;
 export const SNAPSHOT_TTL_MS = 5 * 60_000;
 
@@ -19,7 +20,7 @@ export function serializeInput(model: Model<any>, context: TranscriptContext, de
 	const codex = model.api === "openai-codex-responses";
 	const normalized = resolveTranscript(context, flag("supportsMidConvoSystemMessages"));
 	const tools = resolveTranscript(declarations, flag("supportsMidConvoSystemMessages"));
-	return convertResponsesMessages(model, normalized, model.api === "azure-openai-responses" ? new Set([...TOOL_CALL_PROVIDERS, "azure-openai-responses"]) : TOOL_CALL_PROVIDERS, {
+	return convertResponsesMessages(model, normalized, model.api === "azure-openai-responses" ? AZURE_TOOL_CALL_PROVIDERS : TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: !codex,
 		grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(tools.messages), flag("supportsOpenAIGrammarTools")),
 		supportsMidConvoSystemMessages: flag("supportsMidConvoSystemMessages"),
