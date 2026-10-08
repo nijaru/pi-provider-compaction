@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
@@ -68,8 +68,14 @@ describe("Pi runner + real Responses adapter", () => {
 		const built = await Bun.build({ entrypoints: [process.env.PI_FAST_MODE_FIXTURE_PATH!], target: "bun", packages: "external", plugins: [{ name: "pi-host-bindings", setup(build) { build.onResolve({ filter: /^@earendil-works\// }, ({ path }) => ({ path: import.meta.resolve(path), external: true })); } }] });
 		if (!built.success) throw new Error("Could not load installed fast-mode fixture");
 		const { default: fastFactory } = await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`);
-		const f = await fixture({ api: "openai-codex-responses", fastFactory });
+		const agentDir = await mkdtemp(join(tmpdir(), "provider-compaction-fast-config-"));
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		let f: Awaited<ReturnType<typeof fixture>> | undefined;
 		try {
+			await mkdir(join(agentDir, "extensions"));
+			await writeFile(join(agentDir, "extensions", "pi-fast-mode.json"), JSON.stringify({ active: true }));
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			f = await fixture({ api: "openai-codex-responses", fastFactory });
 			await f.session.prompt("A ".repeat(1000));
 			await f.session.prompt("B ".repeat(100));
 			const result = await f.session.compact();
@@ -82,7 +88,14 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(f.requests.at(-1)!.body.service_tier).toBe("priority");
 			expect(f.requests.at(-1)!.body.input).not.toContainEqual(checkpoint);
 			expect(f.errors).toEqual([]);
-		} finally { await f.close(); }
+		} finally {
+			try { await f?.close(); }
+			finally {
+				if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+				else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+				await rm(agentDir, { recursive: true, force: true });
+			}
+		}
 	});
 	for (const api of ["openai-responses", "azure-openai-responses", "openai-codex-responses"]) test(`${api}: prefix-only acquisition and summary-only replay preserve retained and new messages`, async () => {
 		const f = await fixture({ api });
