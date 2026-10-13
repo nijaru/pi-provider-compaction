@@ -275,6 +275,33 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});
+	test("custom-message triggerTurn runs capture and replay native state like user runs", async () => {
+		const f = await fixture();
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			// Pi 1.2.0 fires before_agent_start for sendMessage({ triggerTurn: true }) runs.
+			await f.session.sendCustomMessage({ customType: "test", content: [{ type: "text", text: "CUSTOM RUN" }], display: false }, { triggerTurn: true });
+			await f.session.waitForIdle();
+			await f.session.prompt("B ".repeat(100));
+			const result = await f.session.compact();
+			expect(f.errors).toEqual([]);
+			expect((result.details as any).version).toBe(3);
+			const native = f.requests.find((request) => new URL(request.url).pathname.endsWith("/compact"))!;
+			const covered = JSON.stringify(native.body.input);
+			expect(covered).toContain("CUSTOM RUN");
+			expect(covered).toContain("A A A");
+			expect(covered).not.toContain("B B B");
+			await f.session.prompt("C new");
+			const last = f.requests.at(-1)!.body.input;
+			expect(last).toContainEqual(checkpoint);
+			const replayed = JSON.stringify(last);
+			expect(replayed).toContain("B B B");
+			expect(replayed).toContain("C new");
+			expect(replayed).not.toContain("CUSTOM RUN");
+			expect(replayed).not.toContain("<summary>");
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
 	test("native failure returns the already-produced portable summary without another request", async () => {
 		const f = await fixture({ nativeFailure: true });
 		try {
