@@ -60,7 +60,7 @@ An explicit generic model takes precedence, matching `pi-compactor`:
 2. trusted `.pi/compaction-policy.json`;
 3. agent `compaction-policy.json`.
 
-An empty `models` list is not an override.
+An empty `models` list is not an override. When `pi-compactor` is loaded, its effective selection takes precedence, including flags injected by an SDK host rather than passed on the command line.
 
 ## Local development
 
@@ -73,7 +73,7 @@ pi --extension ./dist/index.js
 
 The manifest loads the built `dist/index.js`, including a bundled stateless Responses serializer validator; source or host dependency changes require a rebuild. `bun run check` rebuilds first and tests the artifact against Pi's actual host serializer, including function-call history replayed as grammar tools. Keep global installation disabled while testing. Publishing and global activation are separate approval steps.
 
-Tests include real Pi 1.2.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images and prompt updates. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) also checks actual `pi-fast-mode` composition across `/reload`; run it with an isolated `PI_CODING_AGENT_DIR` containing an active, persistent fast-mode configuration.
+Tests include real Pi 1.2.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images and prompt updates. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence in both extension orders. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration.
 
 Authenticated protocol smoke tests are separate and send three small requests:
 

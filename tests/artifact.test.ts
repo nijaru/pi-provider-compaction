@@ -29,14 +29,14 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 		const ctx: any = {
 			model, cwd: process.cwd(), isProjectTrusted: () => false,
 			sessionManager: { getSessionId: () => "fixture", getBranch: () => branch, buildSessionProjection: () => ({ messages: context.messages }) },
-			modelRegistry: { getRegisteredNativeProvider: () => registration, getProvider: () => registration, getApiKeyAndHeaders: async () => ({ ok: true, apiKey }) },
+			modelRegistry: { getRegisteredNativeProvider: () => registration, getProvider: () => registration, getApiKeyAndHeaders: async () => ({ ok: true, apiKey }), registerProvider: (provider: any) => { registration = provider; } },
 			ui: { notify: (value: string) => { status = value; } },
 		};
 		const pi: any = {
 			on: (name: string, handler: Function) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
 			registerCommand: (name: string, command: any) => commands.set(name, command),
 			registerProvider: (provider: any) => { registration = provider; },
-			getFlag: () => undefined, events: { on: () => () => {} },
+			events: { on: () => () => {}, emit() {} },
 		};
 		extension(pi);
 		try {

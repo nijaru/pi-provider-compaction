@@ -4,7 +4,9 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 export type ObserveRequest = (model: Model<any>, context: TranscriptContext, options: StreamOptions) => ((payload: unknown) => unknown | Promise<unknown>) | undefined;
 
 function optionsWithObserver<T extends StreamOptions>(model: Model<any>, context: TranscriptContext, options: T | undefined, observe: ObserveRequest): T | undefined {
-	const handler = observe(model, context, options ?? {});
+	let handler: ReturnType<ObserveRequest>;
+	try { handler = observe(model, context, options ?? {}); }
+	catch { return options; } // An expired or failing optional observer must not veto dispatch.
 	if (!handler) return options;
 	return {
 		...options,
@@ -48,13 +50,15 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 	const native = registry.getRegisteredNativeProvider(id);
 	if (native) {
 		const guarded: ObserveRequest = (...args) => {
+			if (registry.getRegisteredNativeProvider(id) !== wrapper) return;
 			const handler = observe(...args);
 			return handler ? (payload) => registry.getRegisteredNativeProvider(id) === wrapper ? handler(payload) : payload : undefined;
 		};
 		const wrapper = decorateProvider(native, guarded);
 		pi.registerProvider(wrapper);
 		return () => {
-			if (registry.getRegisteredNativeProvider(id) === wrapper) pi.registerProvider(native);
+			// Keep cleanup usable after bare SDK disposal invalidates the extension API.
+			if (registry.getRegisteredNativeProvider(id) === wrapper) registry.registerProvider(native);
 		};
 	}
 	const original = registry.getRegisteredProviderConfig(id);
@@ -66,6 +70,7 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 	// calls and change reasoning semantics. Only decorate an existing stream owner.
 	const delegate = original.streamSimple.bind(original);
 	const guarded: ObserveRequest = (...args) => {
+		if (registry.getRegisteredProviderConfig(id)?.streamSimple !== wrapper) return;
 		const handler = observe(...args);
 		return handler ? (payload) => registry.getRegisteredProviderConfig(id)?.streamSimple === wrapper ? handler(payload) : payload : undefined;
 	};
@@ -79,7 +84,7 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 		if (original?.streamSimple) restored.streamSimple = original.streamSimple;
 		else delete restored.streamSimple;
 		if (!original?.api && restored.api === model.api) delete restored.api;
-		pi.unregisterProvider(id);
-		if (Object.keys(restored).length) pi.registerProvider(id, restored);
+		registry.unregisterProvider(id);
+		if (Object.keys(restored).length) registry.registerProvider(id, restored);
 	};
 }

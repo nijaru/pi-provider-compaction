@@ -1,31 +1,9 @@
 /**
- * Generic-compaction-model precedence resolution shared with pi-compactor.
- *
- * When pi-compactor's generic compaction model is configured — via the
- * `compaction-model` flag or a `compaction-policy.json` file — the explicit
- * generic model takes precedence over provider-native compaction: this
- * extension must not request a native compaction and must not replay a
- * previously persisted native window.
- *
- * Pi scopes `getFlag` to flags the calling extension registered, and Pi
- * rejects two extensions registering the same flag name. This extension
- * therefore never registers `compaction-model` (owned by pi-compactor) and
- * reads the shared CLI value from `process.argv` instead. The policy-file
- * fallback mirrors pi-compactor exactly: project policy requires project
- * trust; the agent-dir policy does not; a valid file with an empty `models`
- * list disables the generic model. This module must stay in sync with
- * `readModelSelectors` in pi-compactor's policy.ts (see
- * tests/policy.test.ts, which always checks the safety contracts and also
- * compares both implementations when the sibling checkout is present).
- *
- * Flag-source note (verified against Pi 0.85.1): extension flag values are
- * populated solely from CLI unknown flags (parseArgs in cli/args.js feeds
- * extensionFlagValues in main.js, applied by applyExtensionFlagValues in
- * agent-session-services.js). There is no config-file flag source, so reading
- * process.argv with Pi's exact parsing rules observes every flag value the
- * host can deliver. A programmatic SDK host injecting extensionFlagValues
- * without argv would not be seen here; flag scoping provides no shared read
- * API for that path.
+ * An explicit generic model suppresses both native acquisition and replay.
+ * Ask pi-compactor for its effective policy first: only the flag's owner can
+ * read SDK-injected extensionFlagValues. The event reply is synchronous.
+ * Without a companion reply, argv and policy files retain standalone support;
+ * their trust, bounds, and empty-policy rules mirror pi-compactor's resolver.
  */
 
 import {
@@ -49,7 +27,7 @@ type PolicyContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted"> & {
 	sessionManager?: Pick<ExtensionContext["sessionManager"], "getSessionDir">;
 };
 
-export type CompactionModelSource = "flag" | "project-policy" | "agent-policy";
+export type CompactionModelSource = "compactor" | "flag" | "project-policy" | "agent-policy";
 
 export interface CompactionModelPolicy {
 	/** True when a generic compaction model takes precedence over native compaction. */
@@ -172,27 +150,24 @@ export function readCompactionModelFlagFromArgv(argv: readonly string[] = proces
 
 /** Resolve whether pi-compactor's generic compaction model takes precedence. */
 export function resolveCompactionModelPolicy(
-	pi: Pick<ExtensionAPI, "getFlag">,
+	pi: { events: Pick<ExtensionAPI["events"], "emit"> },
 	ctx: PolicyContext,
 	argv: readonly string[] = process.argv.slice(2),
 ): CompactionModelPolicy {
+	let effective: boolean | undefined;
+	pi.events.emit("pi-compactor:resolve-model-policy", {
+		context: ctx,
+		respond: (hasSelectors: boolean) => { if (typeof hasSelectors === "boolean") effective = hasSelectors; },
+	});
+	if (effective !== undefined) return effective ? { hasSelectors: true, source: "compactor" } : { hasSelectors: false };
+
 	const argvRaw = readCompactionModelFlagFromArgv(argv);
 	if (typeof argvRaw === "string" && argvRaw.trim()) {
 		const selector = normalizeSelector(argvRaw);
 		return selector ? { hasSelectors: true, source: "flag" } : { hasSelectors: false };
 	}
-	// A bare `--compaction-model` (true) or whitespace value falls through like
-	// pi-compactor: Pi reports "requires a value" and the policy files still apply.
+	// A bare or whitespace flag leaves policy files eligible, like pi-compactor.
 	// An oversized selector above already returned hasSelectors:false.
-	try {
-		const rawFlag = pi.getFlag(COMPACTION_MODEL_FLAG);
-		if (typeof rawFlag === "string" && rawFlag.trim()) {
-			const selector = normalizeSelector(rawFlag);
-			return selector ? { hasSelectors: true, source: "flag" } : { hasSelectors: false };
-		}
-	} catch {
-		// getFlag can throw on a stale context; fall through to policy files.
-	}
 
 	const agentDir = activeAgentDir(ctx);
 	const candidates: Array<{ path: string; source: CompactionModelSource }> = [];

@@ -166,13 +166,28 @@ export default function (pi: ExtensionAPI): void {
 		},
 	});
 	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; active = undefined; pending = undefined; captureStatus = "invalidated by lifecycle/history/policy change"; };
+	const retire = () => {
+		invalidate();
+		const remove = uninstall;
+		uninstall = undefined; installedProvider = undefined; ctx = undefined;
+		remove?.();
+	};
 	const generic = (context: ExtensionContext) => resolveCompactionModelPolicy(pi, context).hasSelectors;
 	const route = (model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions) => routeDigest({ model, apiKey: options.apiKey, headers: options.headers, env: options.env });
 	const unchanged = (branch: readonly SessionEntry[], length: number, hash: string) => branch.length >= length && digest(branch.slice(0, length)) === hash && !branch.slice(length).some((entry) => entry.type === "context_edit");
 
 	const observe: ObserveRequest = (model, context, options) => {
 		const owner = ctx;
-		if (!owner || options.sessionId !== owner.sessionManager.getSessionId()) return;
+		if (!owner) return;
+		let manager: ExtensionContext["sessionManager"];
+		try { manager = owner.sessionManager; }
+		catch {
+			// Bare SDK dispose() invalidates contexts without session_shutdown.
+			// Retire the owned registration before dispatching another session.
+			retire();
+			return;
+		}
+		if (options.sessionId !== manager.getSessionId()) return;
 		if (!supportsNativeCompaction(model)) { captureRejected("unsupported API"); return; }
 		if (!options.onPayload) { captureRejected("no payload callback"); return; }
 		if (generic(owner)) { captureRejected("generic compaction model takes precedence"); return; }
@@ -180,10 +195,14 @@ export default function (pi: ExtensionAPI): void {
 		// fallbacks. Those must not silently select a route absent from our evidence.
 		if (!supportedRouteOptions(model, options)) { captureRejected("unsupported route overrides"); return; }
 		const ticket = generation;
-		const branch = owner.sessionManager.getBranch();
+		const branch = manager.getBranch();
 		const branchHash = digest(branch);
-		const canonical = transcript(owner.sessionManager.buildSessionProjection().messages);
-		const current = () => generation === ticket && ctx === owner && !options.signal?.aborted && supportedRouteOptions(model, options) && digest(owner.sessionManager.getBranch()) === branchHash;
+		const canonical = transcript(manager.buildSessionProjection().messages);
+		const current = () => {
+			if (generation !== ticket || ctx !== owner || options.signal?.aborted || !supportedRouteOptions(model, options)) return false;
+			try { return digest(owner.sessionManager.getBranch()) === branchHash; }
+			catch { retire(); return false; }
+		};
 		return async (payload) => {
 			if (!current()) return payload;
 			snapshot = undefined;
@@ -249,7 +268,7 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("before_agent_start", (_event, context) => { install(context); });
 	pi.on("model_select", (_event, context) => { invalidate(); install(context); });
 	pi.on("session_tree", () => { invalidate(); });
-	pi.on("session_shutdown", () => { invalidate(); uninstall?.(); uninstall = undefined; installedProvider = undefined; ctx = undefined; });
+	pi.on("session_shutdown", retire);
 	// Privacy-policy owners must invalidate before changing a policy that can affect
 	// hidden covered history. Arbitrary dynamic privacy compositions are unsupported.
 	const removeInvalidation = pi.events.on("pi-provider-compaction:invalidate", invalidate);

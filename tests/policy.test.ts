@@ -42,7 +42,7 @@ function context(trusted = true): PolicyContext {
 	return { cwd: projectDir, isProjectTrusted: () => trusted };
 }
 function checkPolicy(argv: string[], expected: CompactionModelPolicy, selectors: string[], ctx = context()) {
-	expect(resolveCompactionModelPolicy({ getFlag: () => undefined }, ctx, argv)).toEqual(expected);
+	expect(resolveCompactionModelPolicy({ events: { emit() {} } }, ctx, argv)).toEqual(expected);
 	if (readModelSelectors) {
 		const value = readCompactionModelFlagFromArgv(argv);
 		expect(readModelSelectors({ getFlag: () => value }, ctx)).toEqual(selectors);
@@ -54,6 +54,20 @@ const project = { hasSelectors: true, source: "project-policy" } as const;
 const flag = { hasSelectors: true, source: "flag" } as const;
 
 describe("generic-model precedence", () => {
+	test("the companion's effective scoped policy overrides argv and mirrored files", () => {
+		writeAgentPolicy(["agent/model"]);
+		const ctx = context();
+		for (const hasSelectors of [true, false]) {
+			const pi = { events: { emit(name: string, request: any) {
+				expect(name).toBe("pi-compactor:resolve-model-policy");
+				expect(request.context).toBe(ctx);
+				request.respond(hasSelectors);
+			} } };
+			expect(resolveCompactionModelPolicy(pi, ctx, ["--compaction-model", "argv/model"])).toEqual(
+				hasSelectors ? { hasSelectors: true, source: "compactor" } : { hasSelectors: false },
+			);
+		}
+	});
 	test("flag forms and last occurrence override both policy files", () => {
 		writeAgentPolicy(["agent/model"]);
 		writeProjectPolicy(["project/model"]);

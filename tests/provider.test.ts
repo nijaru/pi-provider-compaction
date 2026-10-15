@@ -39,6 +39,26 @@ test("complete provider decorator preserves receivers, optional capabilities and
 	expect(calls).toEqual(["refresh", "cancel", "full", "simple"]);
 });
 
+test("optional observer setup and payload failures never block the provider", async () => {
+	const expected = {} as any;
+	let forwarded: any;
+	const base = {
+		stream(_model: any, _context: any, options: any) { forwarded = options; return expected; },
+		streamSimple(_model: any, _context: any, options: any) { forwarded = options; return expected; },
+	} as Provider;
+	const options = { onPayload: async (payload: any) => ({ ...payload, caller: true }) };
+	const expired = decorateProvider(base, () => { throw new Error("disposed observer context"); });
+	for (const method of ["stream", "streamSimple"] as const) {
+		expect(expired[method](model, context, options)).toBe(expected);
+		expect(forwarded).toBe(options);
+	}
+	const failed = decorateProvider(base, () => async () => { throw new Error("observation failed"); });
+	failed.streamSimple(model, context, options);
+	expect(await forwarded.onPayload({}, model)).toEqual({ caller: true });
+	failed.streamSimple(model, context, { onPayload: () => { throw new Error("caller failure"); } });
+	await expect(forwarded.onPayload({}, model)).rejects.toThrow("caller failure");
+});
+
 function registryFixture(original?: any, native?: Provider) {
 	let config = original;
 	let registered = native;
@@ -49,7 +69,8 @@ function registryFixture(original?: any, native?: Provider) {
 		},
 		unregisterProvider() { config = undefined; registered = undefined; },
 	};
-	const registry: any = { getRegisteredProviderConfig: () => config, getRegisteredNativeProvider: () => registered };
+	const registry: any = { getRegisteredProviderConfig: () => config, getRegisteredNativeProvider: () => registered,
+		registerProvider: pi.registerProvider, unregisterProvider: pi.unregisterProvider };
 	const ctx: any = { model, modelRegistry: registry };
 	return { pi, ctx, registry };
 }

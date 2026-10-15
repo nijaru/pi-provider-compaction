@@ -3,8 +3,8 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
-import { createProvider, InMemoryCredentialStore, type Model } from "@earendil-works/pi-ai";
-import { createAgentSession, DefaultResourceLoader, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createProvider, InMemoryCredentialStore, normalizeContext, type Model } from "@earendil-works/pi-ai";
+import { createAgentSessionFromServices, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension from "../index";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { azureOpenAIResponsesApi } from "@earendil-works/pi-ai/api/azure-openai-responses.lazy";
@@ -28,7 +28,14 @@ function completion(text: string): Response {
 	];
 	return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 }
-async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; nativeFailure?: boolean; api?: string; fastFactory?: (pi: ExtensionAPI) => void } = {}) {
+async function loadExternalExtension(path: string): Promise<(pi: ExtensionAPI) => void> {
+	// Extracted packages need the same host bindings Pi supplies at runtime.
+	const built = await Bun.build({ entrypoints: [path], target: "bun", packages: "external", plugins: [{ name: "pi-host-bindings", setup(build) { build.onResolve({ filter: /^@earendil-works\// }, ({ path }) => ({ path: import.meta.resolve(path), external: true })); } }] });
+	if (!built.success) throw new Error(`Could not load extension fixture: ${path}`);
+	return (await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`)).default;
+}
+
+async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "provider-compaction-fixture-"));
 	const requests: { url: string; body: any; headers: Headers }[] = [];
 	const authControl: { key: string; beforeResolve?: () => void; beforeNative?: () => void } = { key: "fixture" };
@@ -49,25 +56,97 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; nativeFail
 	const model: Model<any> = { provider: options.fastFactory ? "openai-codex" : "fixture", api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-5.5" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: false, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 	const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false });
 	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
+	const legacyStream = provider.streamSimple.bind(provider);
 	if (options.fastFactory) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`, models: [model] });
+	else if (options.legacy) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: "fixture", models: [model], streamSimple: legacyStream });
 	else runtime.registerNativeProvider(provider);
 	const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 40, reserveTokens: 1000 }, cacheWarming: "off" });
 	const manager = SessionManager.inMemory(directory);
-	const loader = new DefaultResourceLoader({ cwd: directory, agentDir: directory, settingsManager: settings, noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt: "Fixture policy", extensionFactories: [...(options.fastFactory ? [options.fastFactory] : []), extension, ...(options.hooks ? [options.hooks] : [])] });
-	await loader.reload();
-	const { session } = await createAgentSession({ cwd: directory, agentDir: directory, model, modelRuntime: runtime, sessionManager: manager, settingsManager: settings, resourceLoader: loader, tools: [] });
+	const hooks = options.hooks ? [options.hooks] : [];
+	const services = await createAgentSessionServices({
+		cwd: directory, agentDir: directory, settingsManager: settings, modelRuntime: runtime, extensionFlagValues: options.flagValues,
+		resourceLoaderOptions: {
+			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt: "Fixture policy",
+			extensionFactories: [...(options.fastFactory ? [options.fastFactory] : []), ...(options.hooksFirst ? hooks : []), extension, ...(!options.hooksFirst ? hooks : [])],
+		},
+	});
+	const { session } = await createAgentSessionFromServices({ services, model, sessionManager: manager, tools: [] });
 	const errors: unknown[] = [];
 	await session.bindExtensions({ onError: (error) => errors.push(error) });
-	return { session, manager, requests, errors, runtime, provider, authControl, async close() { session.dispose(); await rm(directory, { recursive: true, force: true }); } };
+	return { session, manager, requests, errors, runtime, provider, legacyStream, authControl, async close() { session.dispose(); await rm(directory, { recursive: true, force: true }); } };
 }
 
 describe("Pi runner + real Responses adapter", () => {
+	test.each([false, true])("SDK-scoped generic policy suppresses native requests in either extension order (companion first=%s)", async (hooksFirst) => {
+		let genericCompactions = 0;
+		const f = await fixture({
+			hooksFirst, flagValues: new Map([["compaction-model", "fixture/summary"]]),
+			hooks(pi) {
+				pi.registerFlag("compaction-model", { description: "Fixture generic model", type: "string" });
+				pi.events.on("pi-compactor:resolve-model-policy", (request: any) => {
+					request.respond(pi.getFlag("compaction-model") === "fixture/summary");
+				});
+				pi.on("session_before_compact", (event) => {
+					expect(pi.getFlag("compaction-model")).toBe("fixture/summary");
+					genericCompactions++;
+					return { compaction: { summary: "Selected generic model", firstKeptEntryId: event.preparation.firstKeptEntryId, tokensBefore: event.preparation.tokensBefore } };
+				});
+			},
+		});
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const requestsBefore = f.requests.length;
+			const result = await f.session.compact();
+			expect(result.summary).toBe("Selected generic model");
+			expect(genericCompactions).toBe(1);
+			expect(f.requests).toHaveLength(requestsBefore);
+			expect(result.details).toBeUndefined();
+		} finally { await f.close(); }
+	});
+
+	test.each([false, true])("bare SDK disposal retires the observer before another session uses the runtime (legacy=%s)", async (legacy) => {
+		const f = await fixture({ legacy });
+		try {
+			await f.session.prompt("Capture the owning session");
+			if (legacy) expect(f.runtime.getRegisteredProviderConfig("fixture")!.streamSimple).not.toBe(f.legacyStream);
+			else expect(f.runtime.getRegisteredNativeProvider("fixture")).not.toBe(f.provider);
+			f.session.dispose();
+			let callerPayload = false;
+			const result = await f.runtime.streamSimple(f.runtime.getModel("fixture", "fixture")!, normalizeContext({
+				messages: [{ role: "user", content: "A different session still works", timestamp: Date.now() }],
+			}), {
+				sessionId: "another-session",
+				onPayload: (payload) => { callerPayload = true; return payload; },
+			}).result();
+			expect(result.stopReason).toBe("stop");
+			expect(callerPayload).toBe(true);
+			if (legacy) expect(f.runtime.getRegisteredProviderConfig("fixture")!.streamSimple).toBe(f.legacyStream);
+			else expect(f.runtime.getRegisteredNativeProvider("fixture")).toBe(f.provider);
+			expect(f.requests.at(-1)!.body.input).not.toContainEqual(checkpoint);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+	for (const hooksFirst of [false, true]) test.skipIf(!process.env.PI_COMPACTOR_FIXTURE_PATH)(`pi-compactor SDK flag prevents duplicate native work (companion first=${hooksFirst})`, async () => {
+		const f = await fixture({
+			hooks: await loadExternalExtension(process.env.PI_COMPACTOR_FIXTURE_PATH!), hooksFirst,
+			flagValues: new Map([["compaction-model", "fixture/fixture"]]),
+		});
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const requestsBefore = f.requests.length;
+			const result = await f.session.compact();
+			expect(result.summary).toBe("Portable summary fixture");
+			expect(f.requests).toHaveLength(requestsBefore + 1);
+			expect(f.requests.some((request) => new URL(request.url).pathname.endsWith("/compact"))).toBe(false);
+			expect((result.details as any)?.type).not.toBe("pi-provider-compaction/openai-responses");
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+
 	test.skipIf(!process.env.PI_FAST_MODE_FIXTURE_PATH)("installed pi-fast-mode composes with native compaction and survives reload", async () => {
-		// Pi's loader resolves host APIs for packages installed without peer deps.
-		// Give the installed source the same host bindings in this Bun fixture.
-		const built = await Bun.build({ entrypoints: [process.env.PI_FAST_MODE_FIXTURE_PATH!], target: "bun", packages: "external", plugins: [{ name: "pi-host-bindings", setup(build) { build.onResolve({ filter: /^@earendil-works\// }, ({ path }) => ({ path: import.meta.resolve(path), external: true })); } }] });
-		if (!built.success) throw new Error("Could not load installed fast-mode fixture");
-		const { default: fastFactory } = await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`);
+		const fastFactory = await loadExternalExtension(process.env.PI_FAST_MODE_FIXTURE_PATH!);
 		const agentDir = await mkdtemp(join(tmpdir(), "provider-compaction-fast-config-"));
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
 		let f: Awaited<ReturnType<typeof fixture>> | undefined;
