@@ -3,7 +3,7 @@ import { normalizeContext, Type, type Model, type Tool, type ProviderStreams } f
 import * as direct from "@earendil-works/pi-ai/api/openai-responses";
 import * as azure from "@earendil-works/pi-ai/api/azure-openai-responses";
 import * as codex from "@earendil-works/pi-ai/api/openai-codex-responses";
-import { capturePreparedRequest, selectCoveredPrefix, serializeInput } from "../replay";
+import { capturePreparedRequest, selectCoveredPrefix, serializeInput, summarySlot } from "../replay";
 
 const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 const grammar: Tool = { name: "edit", description: "Edit", parameters: Type.Object({ input: Type.String() }), constrainedSampling: { type: "grammar", variants: { openai_lark: "start: /.+/" } } };
@@ -15,7 +15,7 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 			{ role: "system", content: "forced policy", toolsAdded: [grammar, strict], timestamp: 1 },
 			{ role: "user", content: "A", timestamp: 2 },
 			{ role: "assistant", api, provider: model.provider, model: model.id, content: [
-				// 1.2.0 serialization omits thinking text; only the opaque reasoning state may cross.
+				// Only the opaque reasoning state may cross; readable thinking is omitted.
 				{ type: "thinking", thinking: "raw private thought", thinkingSignature: JSON.stringify({ type: "reasoning", id: "rs_fixture", summary: [{ type: "summary_text", text: "why" }], encrypted_content: "opaque" }) },
 				{ type: "thinking", thinking: "signatureless thought" },
 				{ type: "toolCall", id: "call id|foreign-item", name: "edit", arguments: { input: "replace text" } },
@@ -57,6 +57,32 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 		}
 	});
 }
+
+test("effort updates preserve exact history, prefix boundaries and the request-only suffix", async () => {
+	const model = { api: "openai-responses", provider: "openai", id: "fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, compat: { supportsMidConvoEffort: true } } as Model<any>;
+	const context = normalizeContext({ systemPrompt: "policy", messages: [
+		{ role: "user", content: "A", timestamp: 1 },
+		{ role: "assistant", api: model.api, provider: model.provider, model: model.id, providerThinkingLevel: "low", content: [{ type: "text", text: "Answer A" }], usage, stopReason: "stop", timestamp: 2 },
+		{ role: "user", content: "B", timestamp: 3 },
+	] });
+	let payload: any;
+	await direct.streamSimple(model, context, { apiKey: "sk-fixture", reasoning: "high", onPayload(value) { payload = value; throw new Error("fixture-stop-before-network"); } }).result();
+	const update = (effort: string) => ({ type: "configuration_update", reasoning: { effort } });
+	expect(payload.input.filter((item: any) => item.type === "configuration_update")).toEqual([update("low"), update("high")]);
+	const snapshot = capturePreparedRequest(model, context, context, payload)!;
+	expect(snapshot).toBeDefined();
+	const prefix = normalizeContext({ messages: context.messages.slice(0, 3) });
+	expect(selectCoveredPrefix(model, snapshot, prefix)).toEqual(payload.input.slice(1, -2));
+	// A summary contributes only its user-message item, not the trailing effort for the next reply.
+	expect(summarySlot(model, snapshot, normalizeContext({ messages: context.messages.slice(0, 2) }))).toBe(1);
+	// Inferring the current effort from the prepared request must not trust arbitrary historical updates.
+	const changed = structuredClone(payload);
+	changed.input.find((item: any) => item.type === "configuration_update").reasoning.effort = "high";
+	expect(capturePreparedRequest(model, context, context, changed)).toBeUndefined();
+	const extra = structuredClone(payload);
+	extra.input.at(-1).unexpected = true;
+	expect(capturePreparedRequest(model, context, context, extra)).toBeUndefined();
+});
 
 test("missing tool result repairs cannot prove a closed coverage boundary", () => {
 	const model = { api: "openai-responses", provider: "openai", id: "fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: false } as Model<any>;

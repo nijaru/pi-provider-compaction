@@ -14,7 +14,7 @@ export function equal(left: unknown, right: unknown): boolean {
 }
 
 /** Validator only. No serialized item from this function is transmitted. */
-export function serializeInput(model: Model<any>, context: TranscriptContext, declarations = context): ResponseItem[] {
+export function serializeInput(model: Model<any>, context: TranscriptContext, declarations = context, configurationUpdateEffort?: string): ResponseItem[] {
 	const compat = model.compat as Record<string, unknown> | undefined;
 	const flag = (name: string) => compat?.[name] === true;
 	const codex = model.api === "openai-codex-responses";
@@ -22,6 +22,7 @@ export function serializeInput(model: Model<any>, context: TranscriptContext, de
 	const tools = resolveTranscript(declarations, flag("supportsMidConvoSystemMessages"));
 	return convertResponsesMessages(model, normalized, model.api === "azure-openai-responses" ? AZURE_TOOL_CALL_PROVIDERS : TOOL_CALL_PROVIDERS, {
 		includeSystemPrompt: !codex,
+		configurationUpdateEffort,
 		grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(tools.messages), flag("supportsOpenAIGrammarTools")),
 		supportsMidConvoSystemMessages: flag("supportsMidConvoSystemMessages"),
 		supportsAdditionalTools: flag("supportsAdditionalTools"),
@@ -40,6 +41,8 @@ export interface PreparedRequest {
 	payload: JsonObject & { input: ResponseItem[] };
 	/** The portable wire input before our sole summary substitution. */
 	portableInput: ResponseItem[];
+	/** The final request-only effort update; historical efforts come from the transcript. */
+	configurationUpdateEffort?: string;
 	replacement?: { index: number; count: number };
 	createdAt: number;
 }
@@ -52,15 +55,29 @@ export function capturePreparedRequest(
 	// Reject stateful provider requests: coverage must be the complete visible input.
 	if (payload.previous_response_id || payload.conversation) { reject("stateful request"); return; }
 	if (Buffer.byteLength(JSON.stringify({ context, payload })) > MAX_SNAPSHOT_BYTES) { reject("snapshot exceeds size limit"); return; }
-	const expected = serializeInput(model, context);
+	// Read the actual prepared request's mode, not provider/auth guesses. Exact conversion
+	// below still validates every historical update, its position and its complete shape.
+	const last = payload.input.at(-1);
+	const compat = model.compat as Record<string, unknown> | undefined;
+	const configurationUpdateEffort = model.api === "openai-responses" && compat?.supportsMidConvoEffort === true &&
+		last?.type === "configuration_update" && isObject(last.reasoning) && typeof last.reasoning.effort === "string"
+		? last.reasoning.effort : undefined;
+	const expected = serializeInput(model, context, context, configurationUpdateEffort);
 	if (!equal(expected, payload.input)) { reject("prepared input differs from serializer"); return; }
-	return { context: structuredClone(context), canonical: structuredClone(canonical), payload: structuredClone(payload) as PreparedRequest["payload"], portableInput: expected, createdAt: Date.now() };
+	return { context: structuredClone(context), canonical: structuredClone(canonical), payload: structuredClone(payload) as PreparedRequest["payload"], portableInput: expected, configurationUpdateEffort, createdAt: Date.now() };
 }
 
 function promptCount(input: readonly ResponseItem[]): number {
 	let count = 0;
 	while (input[count]?.role === "system" || input[count]?.role === "developer") count++;
 	return count;
+}
+
+function serializePrefix(model: Model<any>, snapshot: PreparedRequest, prefix: TranscriptContext): ResponseItem[] {
+	const input = serializeInput(model, prefix, snapshot.context, snapshot.configurationUpdateEffort);
+	// The converter appends the next reply's effort even to a partial transcript.
+	// It is not historical coverage and must remain in the live suffix on replay.
+	return snapshot.configurationUpdateEffort === undefined ? input : input.slice(0, -1);
 }
 
 /** No open/synthetic tool exchange may cross the coverage boundary. */
@@ -94,7 +111,7 @@ export function selectCoveredPrefix(model: Model<any>, snapshot: PreparedRequest
 	if (!closedTools(prefix)) { reject("prefix has an incomplete tool exchange or failed assistant"); return; }
 	const mapped = mappedPrefix(snapshot, prefix);
 	if (!mapped) { reject("projected prefix differs from request context"); return; }
-	const expected = serializeInput(model, mapped, snapshot.context);
+	const expected = serializePrefix(model, snapshot, mapped);
 	if (!equal(snapshot.portableInput.slice(0, expected.length), expected)) { reject("serialized prefix does not match prepared input"); return; }
 	const start = promptCount(expected);
 	let end = expected.length;
@@ -121,7 +138,7 @@ export function substituteSummary(
 export function summarySlot(model: Model<any>, snapshot: PreparedRequest, summaryPrefix: TranscriptContext): number | undefined {
 	const mapped = mappedPrefix(snapshot, summaryPrefix);
 	if (!mapped) return;
-	const prefix = serializeInput(model, mapped, snapshot.context);
+	const prefix = serializePrefix(model, snapshot, mapped);
 	const index = promptCount(prefix);
 	if (prefix.length !== index + 1 || !equal(snapshot.portableInput.slice(0, prefix.length), prefix)) return;
 	return index;

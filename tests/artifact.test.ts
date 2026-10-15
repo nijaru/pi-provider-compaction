@@ -13,11 +13,11 @@ const grammar: Tool = { name: "edit", description: "Edit", parameters: Type.Obje
 
 for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-responses", azure], ["openai-codex-responses", codex]] as const) {
 	for (const crossModel of [false, true]) test(`${api}: built artifact captures ${crossModel ? "cross-model ctc_*" : "same-model fc_* promoted to grammar"} history`, async () => {
-		const model: Model<any> = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : "azure", id: "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: false, contextWindow: 100000, maxTokens: 1000, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true } };
+		const model: Model<any> = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : "azure", id: "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, contextWindow: 100000, maxTokens: 1000, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true, supportsMidConvoEffort: api === "openai-responses" } };
 		const id = crossModel ? "call_A|ctc_A" : "call_A|fc_A";
 		const context = normalizeContext({ systemPrompt: "policy", tools: [grammar], messages: [
 			{ role: "user", content: "Edit A", timestamp: 1 },
-			{ role: "assistant", provider: model.provider, api, model: crossModel ? "other" : model.id, content: [{ type: "toolCall", id, name: "edit", arguments: { input: "A" } }], stopReason: "toolUse", usage, timestamp: 2 },
+			{ role: "assistant", provider: model.provider, api, model: crossModel ? "other" : model.id, providerThinkingLevel: "low", content: [{ type: "thinking", thinking: "private thought" }, { type: "toolCall", id, name: "edit", arguments: { input: "A" } }], stopReason: "toolUse", usage, timestamp: 2 },
 			{ role: "toolResult", toolCallId: id, toolName: "edit", content: [{ type: "text", text: "OK" }], isError: false, timestamp: 3 },
 		] });
 		const handlers = new Map<string, Function[]>();
@@ -25,7 +25,7 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 		let registration: any = { id: model.provider, ...(adapter as ProviderStreams) };
 		let status = "";
 		const branch = context.messages.map((message, i) => ({ type: "message", id: String(i), parentId: i ? String(i - 1) : null, timestamp: "2026-10-04", message }));
-		const apiKey = `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`;
+		const apiKey = api === "openai-responses" ? "sk-fixture" : `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`;
 		const ctx: any = {
 			model, cwd: process.cwd(), isProjectTrusted: () => false,
 			sessionManager: { getSessionId: () => "fixture", getBranch: () => branch, buildSessionProjection: () => ({ messages: context.messages }) },
@@ -43,7 +43,7 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 			for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "new" }, ctx);
 			let payload: any;
 			const result = await registration.streamSimple(model, context, {
-				sessionId: "fixture", apiKey, transport: "sse", maxRetries: 0,
+				sessionId: "fixture", apiKey, reasoning: "high", transport: "sse", maxRetries: 0,
 				async onPayload(value: any) { await Promise.resolve(); payload = value; return value; },
 				fetch: () => { throw new Error("fixture-stop-before-network"); },
 			}).result();
@@ -53,6 +53,8 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 			expect(payload.input.find((item: any) => item.type === "custom_tool_call")).toMatchObject({ call_id: "call_A", name: "edit", input: "A" });
 			expect(payload.input.find((item: any) => item.type === "custom_tool_call").id).toBeUndefined();
 			expect(payload.input.some((item: any) => item.type === "custom_tool_call_output")).toBe(true);
+			expect(JSON.stringify(payload.input)).not.toContain("private thought");
+			if (api === "openai-responses") expect(payload.input.at(-1)).toEqual({ type: "configuration_update", reasoning: { effort: "high" } });
 			await commands.get("provider-compaction-status").handler("", ctx);
 			expect(status).toContain("Observer: installed");
 			expect(status).toContain("Capture: eligible prepared request captured");

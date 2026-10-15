@@ -1,6 +1,6 @@
 # pi-provider-compaction
 
-Experimental provider-native compaction for [Pi](https://github.com/earendil-works/pi), with a meaningful portable summary saved alongside each native checkpoint. Minimum runtime: Pi 0.87.0. Development checks target Pi 1.2.0.
+Experimental provider-native compaction for [Pi](https://github.com/earendil-works/pi), with a meaningful portable summary saved alongside each native checkpoint. Minimum runtime: Pi 0.87.0. Development checks target Pi 1.3.0.
 
 **This experimental design is not production-validated. Do not enable it globally yet.** Real runner/adapter fixtures and a Codex live smoke test pass; broader backend and deployment validation remains incomplete.
 
@@ -73,7 +73,7 @@ pi --extension ./dist/index.js
 
 The manifest loads the built `dist/index.js`, including a bundled stateless Responses serializer validator; source or host dependency changes require a rebuild. `bun run check` rebuilds first and tests the artifact against Pi's actual host serializer, including function-call history replayed as grammar tools. Keep global installation disabled while testing. Publishing and global activation are separate approval steps.
 
-Tests include real Pi 1.2.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images and prompt updates. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence in both extension orders. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration.
+Tests include real Pi 1.3.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence in both extension orders. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration.
 
 Authenticated protocol smoke tests are separate and send three small requests:
 

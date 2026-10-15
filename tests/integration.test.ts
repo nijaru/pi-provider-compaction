@@ -36,7 +36,7 @@ async function loadExternalExtension(path: string): Promise<(pi: ExtensionAPI) =
 	return (await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`)).default;
 }
 
-async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean } = {}) {
+async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "provider-compaction-fixture-"));
 	const requests: { url: string; body: any; headers: Headers }[] = [];
 	const authControl: { key: string; beforeResolve?: () => void; beforeNative?: () => void } = { key: "fixture" };
@@ -54,7 +54,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 		}
 		return completion("Portable summary fixture");
 	}) as typeof fetch;
-	const model: Model<any> = { provider: options.fastFactory ? "openai-codex" : "fixture", api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-5.5" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: false, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+	const model: Model<any> = { provider: options.fastFactory ? "openai-codex" : "fixture", api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-5.5" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: options.thinking ?? false, compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 	const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false });
 	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
 	const legacyStream = provider.streamSimple.bind(provider);
@@ -71,7 +71,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 			extensionFactories: [...(options.fastFactory ? [options.fastFactory] : []), ...(options.hooksFirst ? hooks : []), extension, ...(!options.hooksFirst ? hooks : [])],
 		},
 	});
-	const { session } = await createAgentSessionFromServices({ services, model, sessionManager: manager, tools: [] });
+	const { session } = await createAgentSessionFromServices({ services, model, thinkingLevel: options.thinking ? "low" : undefined, sessionManager: manager, tools: [] });
 	const errors: unknown[] = [];
 	await session.bindExtensions({ onError: (error) => errors.push(error) });
 	return { session, manager, requests, errors, runtime, provider, legacyStream, authControl, async close() { session.dispose(); await rm(directory, { recursive: true, force: true }); } };
@@ -213,6 +213,27 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(JSON.stringify(last.input)).toContain("C new");
 			expect(last.input.filter((item: any) => JSON.stringify(item).includes("B B B"))).toHaveLength(1);
 			expect(JSON.stringify(last.input)).not.toContain("<summary>");
+		} finally { await f.close(); }
+	});
+	test("thinking-level changes retain native replay and the next reply's effort", async () => {
+		const f = await fixture({ thinking: true });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			f.session.setThinkingLevel("high");
+			await f.session.prompt("B ".repeat(100));
+			const result = await f.session.compact();
+			expect((result.details as any)?.version).toBe(3);
+			const native = f.requests.find((request) => new URL(request.url).pathname.endsWith("/compact"))!;
+			expect(native.body.input).toContainEqual({ type: "configuration_update", reasoning: { effort: "low" } });
+			expect(JSON.stringify(native.body.input)).not.toContain("B B B");
+			f.session.setThinkingLevel("medium");
+			await f.session.prompt("C new");
+			const last = f.requests.at(-1)!.body;
+			expect(last.input).toContainEqual(checkpoint);
+			expect(last.input.at(-1)).toEqual({ type: "configuration_update", reasoning: { effort: "medium" } });
+			expect(JSON.stringify(last.input)).toContain("B B B");
+			expect(JSON.stringify(last.input)).toContain("C new");
+			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});
 	test("repeated compaction covers previous native prefix plus newly summarized retained history", async () => {
