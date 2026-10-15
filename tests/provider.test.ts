@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { normalizeContext, type Provider } from "@earendil-works/pi-ai";
-import { decorateProvider, installObserver } from "../provider";
+import { decorateProvider, installObserver, STREAM_OBSERVER } from "../provider";
 
 const model = { provider: "fixture", api: "openai-responses", id: "fixture" } as any;
 const context = normalizeContext({ messages: [] });
@@ -79,17 +79,22 @@ test("legacy /fast-style registration preserves callback/config and restores onl
 	let forwarded: any;
 	const original = { api: model.api, headers: { "model-header": "kept" }, models: [{ ...model, headers: { special: "kept" } }], streamSimple(_model: any, _context: any, options: any) { expect(this).toBe(original); forwarded = options; return {} as any; } };
 	const f = registryFixture(original);
-	const remove = installObserver(f.pi, f.ctx, () => (payload) => ({ ...(payload as any), observed: true }))!;
-	f.registry.getRegisteredProviderConfig().streamSimple(model, context, { onPayload: (payload: any) => ({ ...payload, service_tier: "priority" }) });
+	const installed = installObserver(f.pi, f.ctx, () => (payload) => ({ ...(payload as any), observed: true }))!;
+	const wrapper = f.registry.getRegisteredProviderConfig().streamSimple;
+	const lease = wrapper[STREAM_OBSERVER];
+	expect(lease.delegate).toBe(original.streamSimple);
+	expect(installed.isInstalled()).toBe(true);
+	wrapper(model, context, { onPayload: (payload: any) => ({ ...payload, service_tier: "priority" }) });
 	expect(await forwarded.onPayload({}, model)).toEqual({ service_tier: "priority", observed: true });
 	expect(f.registry.getRegisteredProviderConfig().models).toBe(original.models);
 	f.pi.registerProvider(model.provider, { name: "Updated independently" });
-	remove();
+	lease.release();
+	expect(installed.isInstalled()).toBe(false);
 	expect(f.registry.getRegisteredProviderConfig()).toEqual({ ...original, name: "Updated independently" });
-	const remove2 = installObserver(f.pi, f.ctx, () => undefined)!;
+	const installed2 = installObserver(f.pi, f.ctx, () => undefined)!;
 	const replacement = () => ({});
 	f.pi.registerProvider(model.provider, { streamSimple: replacement });
-	remove2();
+	installed2.remove();
 	expect(f.registry.getRegisteredProviderConfig().streamSimple).toBe(replacement);
 });
 

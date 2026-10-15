@@ -6,6 +6,7 @@ import { zstdDecompressSync } from "node:zlib";
 import { createProvider, InMemoryCredentialStore, normalizeContext, type Model } from "@earendil-works/pi-ai";
 import { createAgentSessionFromServices, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension from "../index";
+import { STREAM_OBSERVER } from "../provider";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { azureOpenAIResponsesApi } from "@earendil-works/pi-ai/api/azure-openai-responses.lazy";
 import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-responses.lazy";
@@ -112,6 +113,8 @@ describe("Pi runner + real Responses adapter", () => {
 			if (legacy) expect(f.runtime.getRegisteredProviderConfig("fixture")!.streamSimple).not.toBe(f.legacyStream);
 			else expect(f.runtime.getRegisteredNativeProvider("fixture")).not.toBe(f.provider);
 			f.session.dispose();
+			if (legacy) expect(f.runtime.getRegisteredProviderConfig("fixture")!.streamSimple).toBe(f.legacyStream);
+			else expect(f.runtime.getRegisteredNativeProvider("fixture")).toBe(f.provider);
 			let callerPayload = false;
 			const result = await f.runtime.streamSimple(f.runtime.getModel("fixture", "fixture")!, normalizeContext({
 				messages: [{ role: "user", content: "A different session still works", timestamp: Date.now() }],
@@ -141,6 +144,21 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(f.requests).toHaveLength(requestsBefore + 1);
 			expect(f.requests.some((request) => new URL(request.url).pathname.endsWith("/compact"))).toBe(false);
 			expect((result.details as any)?.type).not.toBe("pi-provider-compaction/openai-responses");
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+
+	test("an explicitly released observer is reinstalled before the next request", async () => {
+		const f = await fixture({ legacy: true });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			const wrapper = f.runtime.getRegisteredProviderConfig("fixture")!.streamSimple!;
+			Reflect.get(wrapper, STREAM_OBSERVER).release();
+			expect(f.runtime.getRegisteredProviderConfig("fixture")!.streamSimple).toBe(f.legacyStream);
+			await f.session.prompt("B ".repeat(100));
+			expect(f.runtime.getRegisteredProviderConfig("fixture")!.streamSimple).not.toBe(f.legacyStream);
+			const result = await f.session.compact();
+			expect((result.details as any)?.version).toBe(3);
 			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});

@@ -38,7 +38,7 @@ Request-only suffix additions, deletions, redactions and reordering can survive 
 
 Version 3 stores the portable summary, native output, usage, route identity and validated prefix metadata in one compaction entry. Both generation requests contribute to usage accounting. Raw credentials, complete auth headers and request snapshots are never persisted.
 
-Native eligibility is deliberately **session-local and short-lived**. Restart, reload, resume, fork, tree navigation, model changes, covered-history edits, and relevant prompt/tool/route changes revoke it. A credential refresh may conservatively revoke it too. Persisted native metadata alone is not authority to replay hidden content under a new runtime's privacy policy.
+Native eligibility is deliberately **session-local and short-lived**. Restart, reload, SDK disposal, resume, fork, tree navigation, model changes, covered-history edits, and relevant prompt/tool/route changes revoke it. A credential refresh may conservatively revoke it too. Persisted native metadata alone is not authority to replay hidden content under a new runtime's privacy policy.
 
 Dynamic privacy policies that can change what previously covered history is allowed to reveal are **not transparently supported**. A cooperating policy owner must emit `pi-provider-compaction:invalidate` before such a change; otherwise keep this extension disabled. Matching visible summary text cannot establish that hidden native state obeys a new policy.
 

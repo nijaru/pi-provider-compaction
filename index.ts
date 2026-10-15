@@ -1,9 +1,9 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { normalizeContext, type Model, type Provider, type ProviderHeaders, type ProviderStreamOptions, type SimpleStreamOptions, type TranscriptContext, type Usage } from "@earendil-works/pi-ai";
+import { normalizeContext, registerSessionResourceCleanup, type Model, type Provider, type ProviderHeaders, type ProviderStreamOptions, type SimpleStreamOptions, type TranscriptContext, type Usage } from "@earendil-works/pi-ai";
 import { compact, convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveCompactionModelPolicy } from "./policy";
-import { installObserver, type ObserveRequest } from "./provider";
+import { installObserver, type InstalledObserver, type ObserveRequest } from "./provider";
 import { capturePreparedRequest, equal, requestPolicy, selectCoveredPrefix, substituteSummary, summarySlot, type PreparedRequest } from "./replay";
 import { isObject, requestProviderCompaction, resolveNativeProtocol, supportsResponsesApi, validateCompactedOutput, type NativeProtocol, type ResponseItem } from "./protocol";
 
@@ -152,8 +152,8 @@ export default function (pi: ExtensionAPI): void {
 	let snapshot: Captured | undefined;
 	let active: Active | undefined;
 	let pending: { details: NativeCompactionDetails; capture: Captured; summary: string } | undefined;
-	let uninstall: (() => void) | undefined;
-	let installedProvider: string | undefined;
+	let observer: InstalledObserver | undefined;
+	let unregisterCleanup: (() => void) | undefined;
 	let generation = 0;
 	let captureStatus = "no request observed";
 	let compactionStatus = "not attempted in this runtime";
@@ -162,15 +162,16 @@ export default function (pi: ExtensionAPI): void {
 	pi.registerCommand("provider-compaction-status", {
 		description: "Show content-free native compaction eligibility and last attempt",
 		handler: async (_args, context) => {
-			context.ui.notify(`Provider compaction\nObserver: ${installedProvider ? "installed" : "unavailable for current registration"}\nCapture: ${captureStatus}\nLast attempt: ${compactionStatus}`, "info");
+			context.ui.notify(`Provider compaction\nObserver: ${observer?.isInstalled() ? "installed" : "unavailable for current registration"}\nCapture: ${captureStatus}\nLast attempt: ${compactionStatus}`, "info");
 		},
 	});
 	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; active = undefined; pending = undefined; captureStatus = "invalidated by lifecycle/history/policy change"; };
 	const retire = () => {
 		invalidate();
-		const remove = uninstall;
-		uninstall = undefined; installedProvider = undefined; ctx = undefined;
-		remove?.();
+		const installed = observer;
+		observer = undefined; ctx = undefined;
+		unregisterCleanup?.(); unregisterCleanup = undefined;
+		installed?.remove();
 	};
 	const generic = (context: ExtensionContext) => resolveCompactionModelPolicy(pi, context).hasSelectors;
 	const route = (model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions) => routeDigest({ model, apiKey: options.apiKey, headers: options.headers, env: options.env });
@@ -253,15 +254,20 @@ export default function (pi: ExtensionAPI): void {
 
 	const install = (context: ExtensionContext) => {
 		ctx = context;
-		if (installedProvider === context.model?.provider) return;
-		uninstall?.(); uninstall = undefined; installedProvider = undefined;
+		if (observer?.provider === context.model?.provider && observer?.isInstalled()) return;
+		if (observer) { invalidate(); observer.remove(); observer = undefined; }
 		if (!supportsNativeCompaction(context.model)) return;
-		uninstall = installObserver(pi, context, observe);
-		if (uninstall) installedProvider = context.model.provider;
-		captureStatus = uninstall ? "awaiting prepared request" : "unsupported provider registration";
+		observer = installObserver(pi, context, observe);
+		captureStatus = observer ? "awaiting prepared request" : "unsupported provider registration";
 	};
 	pi.on("session_start", (_event, context) => {
-		invalidate(); install(context);
+		retire(); install(context);
+		const sessionId = context.sessionManager.getSessionId();
+		// AgentSession.dispose() cleans session resources even without emitting
+		// session_shutdown. The captured registry keeps owned cleanup usable.
+		unregisterCleanup = registerSessionResourceCleanup((disposedId) => {
+			if (disposedId === undefined || disposedId === sessionId) retire();
+		});
 		const latest = latestCompaction(context.sessionManager.getBranch());
 		if (latest?.summary === NATIVE_COMPACTION_SUMMARY) context.ui.notify("Legacy native compaction has no portable summary. Native replay is disabled; recover from earlier history or start a new session.", "warning");
 	});
