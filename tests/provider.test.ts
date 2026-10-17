@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { normalizeContext, type Provider } from "@earendil-works/pi-ai";
 import { decorateProvider, installObserver, STREAM_OBSERVER } from "../provider";
+import { NativeCompactionValidationError, requestProviderCompaction } from "../protocol";
 
 const model = { provider: "fixture", api: "openai-responses", id: "fixture" } as any;
 const context = normalizeContext({ messages: [] });
@@ -104,4 +105,45 @@ test("plain builtins and stateful legacy composers are not replaced", () => {
 		expect(installObserver(f.pi, f.ctx, () => undefined)).toBeUndefined();
 		expect(f.registry.getRegisteredProviderConfig()).toBe(config);
 	}
+});
+
+const nativeUsage = { input: 2, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 3, cost: { input: 0.1, output: 0.2, cacheRead: 0, cacheWrite: 0, total: 0.3 } };
+const nativeCheckpoint = { type: "compaction", encrypted_content: "opaque" };
+
+function nativeProvider(onOptions: (options: any) => void): Provider {
+	return {
+		id: "fixture", name: "Fixture", auth: {}, getModels: () => [model],
+		stream(_model: any, _context: any, options: any) {
+			onOptions(options);
+			void options.onPayload({ model: "fixture", input: [] });
+			void options.fetch("https://fixture.invalid/v1/responses", { method: "POST", body: "{}", headers: {} });
+			return (async function* () {
+				yield { type: "done", message: { role: "assistant", api: "openai-responses", provider: "fixture", model: "fixture", content: [], usage: nativeUsage, stopReason: "stop", timestamp: Date.now() } };
+			})();
+		},
+	} as unknown as Provider;
+}
+
+test("native transport forwards the captured service tier and keeps billed usage", async () => {
+	let forwarded: any;
+	const provider = nativeProvider((options) => { forwarded = options; });
+	const result = await requestProviderCompaction({
+		provider, model, context, input: [{ role: "user", content: "x" }], preparedPayload: { model: "fixture", input: [] },
+		serviceTier: "priority", signal: new AbortController().signal, fetch: (async () => Response.json({ output: [nativeCheckpoint], usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } })) as unknown as typeof fetch,
+		protocol: "responses-compact",
+	});
+	expect(forwarded.serviceTier).toBe("priority");
+	expect(result.output).toEqual([nativeCheckpoint]);
+	expect(result.usage.cost.total).toBe(0.3);
+});
+
+test("an unusable native window reports the billed usage for the fallback", async () => {
+	const provider = nativeProvider(() => {});
+	const error = await requestProviderCompaction({
+		provider, model, context, input: [{ role: "user", content: "x" }], preparedPayload: { model: "fixture", input: [] },
+		signal: new AbortController().signal, fetch: (async () => Response.json({ output: [], usage: { input_tokens: 2, output_tokens: 1, total_tokens: 3 } })) as unknown as typeof fetch,
+		protocol: "responses-compact",
+	}).catch((caught) => caught);
+	expect(error).toBeInstanceOf(NativeCompactionValidationError);
+	expect(error.usage.cost.total).toBe(0.3);
 });

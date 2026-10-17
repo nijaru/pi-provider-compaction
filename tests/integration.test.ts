@@ -194,6 +194,66 @@ describe("Pi runner + real Responses adapter", () => {
 			}
 		}
 	});
+	test("a companion entry appended after compaction does not disable native replay", async () => {
+		const f = await fixture({
+			hooksFirst: true,
+			hooks: (pi) => { pi.on("session_compact", () => { pi.appendEntry("companion-state", { captured: true }); }); },
+		});
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const result = await f.session.compact();
+			expect((result.details as any)?.version).toBe(3);
+			await f.session.prompt("C after companion state");
+			expect(f.requests.at(-1)!.body.input).toContainEqual(checkpoint);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+
+	test("an unrelated entry appended during compaction does not cancel it", async () => {
+		let compacting = false;
+		const f = await fixture({
+			hooksFirst: true,
+			hooks: (pi) => {
+				pi.on("session_before_compact", () => { compacting = true; });
+				pi.on("before_provider_request", () => {
+					if (!compacting) return;
+					compacting = false;
+					pi.appendEntry("companion-state", { during: true });
+				});
+			},
+		});
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const result = await f.session.compact();
+			expect((result.details as any)?.version).toBe(3);
+			await f.session.prompt("C after concurrent state");
+			expect(f.requests.at(-1)!.body.input).toContainEqual(checkpoint);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+
+	test("a payload-level model rewrite prevents native replay", async () => {
+		let rewrite = false;
+		const f = await fixture({
+			hooks: (pi) => {
+				pi.on("before_provider_request", (event) => rewrite ? { ...(event.payload as object), model: "other-model" } : undefined);
+			},
+		});
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const result = await f.session.compact();
+			expect((result.details as any)?.version).toBe(3);
+			rewrite = true;
+			await f.session.prompt("C with rewritten model");
+			expect(f.requests.at(-1)!.body.model).toBe("other-model");
+			expect(f.requests.at(-1)!.body.input).not.toContainEqual(checkpoint);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+
 	for (const api of ["openai-responses", "azure-openai-responses", "openai-codex-responses"]) test(`${api}: prefix-only acquisition and summary-only replay preserve retained and new messages`, async () => {
 		const f = await fixture({ api });
 		try {

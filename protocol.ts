@@ -225,8 +225,18 @@ interface TransportRequest {
 	apiKey?: string;
 	headers?: ProviderHeaders;
 	env?: Record<string, string>;
+	/** Cost-relevant request option captured with the original request. */
+	serviceTier?: string;
 	signal: AbortSignal;
 	fetch?: typeof globalThis.fetch;
+}
+
+/** The provider answered and was billed, but its window cannot be committed. */
+export class NativeCompactionValidationError extends Error {
+	constructor(message: string, readonly usage?: Usage) {
+		super(message);
+		this.name = "NativeCompactionValidationError";
+	}
 }
 
 export interface TransportResponse {
@@ -258,8 +268,12 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 			});
 			if (!response.ok) return response;
 			const parsed = await readJsonBounded(response, request.signal);
-			if (!isObject(parsed)) throw new Error("Responses Compact returned a non-object response");
-			compacted = { response: parsed, output: validateCompactedOutput(parsed) };
+			try {
+				if (!isObject(parsed)) throw new Error("Responses Compact returned a non-object response");
+				compacted = { response: parsed, output: validateCompactedOutput(parsed) };
+			} catch (error) {
+				throw new NativeCompactionValidationError(error instanceof Error ? error.message : String(error));
+			}
 			return syntheticCompletion(parsed, preparedPayload);
 		} catch (error) {
 			bridgeError = error;
@@ -272,6 +286,7 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 		headers: request.headers,
 		env: request.env,
 		signal: request.signal,
+		...(request.serviceTier === undefined ? {} : { serviceTier: request.serviceTier }),
 		transport: "sse",
 		cacheRetention: "none",
 		maxRetries: 0,
@@ -288,6 +303,7 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 		if (bridgeError) throw bridgeError;
 		throw error;
 	});
+	if (bridgeError instanceof NativeCompactionValidationError) throw new NativeCompactionValidationError(bridgeError.message, usage);
 	if (bridgeError) throw bridgeError;
 	if (!compacted || dispatches !== 1) throw new Error("Responses Compact did not complete exactly one request");
 	return { output: compacted.output, usage };
@@ -410,6 +426,7 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 		headers: request.headers,
 		env: request.env,
 		signal: request.signal,
+		...(request.serviceTier === undefined ? {} : { serviceTier: request.serviceTier }),
 		transport: "sse",
 		cacheRetention: "none",
 		maxRetries: 0,
@@ -436,5 +453,9 @@ export async function requestProviderCompaction(
 	request: TransportRequest & { protocol: NativeProtocol },
 ): Promise<TransportResponse> {
 	const result = await (request.protocol === "remote-v2" ? requestRemoteV2(request) : requestResponsesCompact(request));
-	return { ...result, output: validateCompactedOutput(result) };
+	try {
+		return { ...result, output: validateCompactedOutput(result) };
+	} catch (error) {
+		throw new NativeCompactionValidationError(error instanceof Error ? error.message : String(error), result.usage);
+	}
 }
