@@ -22,7 +22,7 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 		] });
 		const handlers = new Map<string, Function[]>();
 		const commands = new Map<string, any>();
-		let registration: any = { id: model.provider, ...(adapter as ProviderStreams) };
+		let registration: any = { id: model.provider, getModels: () => [model], ...(adapter as ProviderStreams) };
 		let status = "";
 		const branch = context.messages.map((message, i) => ({ type: "message", id: String(i), parentId: i ? String(i - 1) : null, timestamp: "2026-10-04", message }));
 		const apiKey = api === "openai-responses" ? "sk-fixture" : `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`;

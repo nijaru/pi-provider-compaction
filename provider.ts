@@ -59,6 +59,11 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 	const id = model.provider;
 	const native = registry.getRegisteredNativeProvider(id);
 	if (native) {
+		// Pi composes a native base only when its catalog serves the active API.
+		// Otherwise the request goes to the global API provider and bypasses this
+		// wrapper; claiming an observer there would report native compaction as
+		// installed while never capturing anything.
+		if (typeof native.getModels !== "function" || !native.getModels().some((entry) => entry.api === model.api)) return;
 		const isInstalled = () => registry.getRegisteredNativeProvider(id) === wrapper;
 		const guarded: ObserveRequest = (...args) => {
 			if (!isInstalled()) return;

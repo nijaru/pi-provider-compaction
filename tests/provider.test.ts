@@ -99,6 +99,18 @@ test("legacy /fast-style registration preserves callback/config and restores onl
 	expect(f.registry.getRegisteredProviderConfig().streamSimple).toBe(replacement);
 });
 
+test("a native base that cannot dispatch the active API is not falsely claimed", () => {
+	const foreign = { ...model, api: "anthropic-messages" };
+	const base = {
+		id: "fixture", name: "Fixture", auth: {},
+		getModels: () => [foreign], filterModels: (models: any) => models,
+		stream() { return {} as any; }, streamSimple() { return {} as any; },
+	} as unknown as Provider;
+	const f = registryFixture(undefined, base);
+	expect(installObserver(f.pi, f.ctx, () => undefined)).toBeUndefined();
+	expect(f.registry.getRegisteredNativeProvider()).toBe(base);
+});
+
 test("plain builtins and stateful legacy composers are not replaced", () => {
 	for (const config of [undefined, { api: model.api }, { api: model.api, streamSimple() {}, refreshModels() {} }, { api: model.api, streamSimple() {}, oauth: { modifyModels() {} } }]) {
 		const f = registryFixture(config);
