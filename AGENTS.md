@@ -23,9 +23,10 @@ Experimental cached and provider-native compaction; the minimum runtime remains 
 ## Provider ownership
 
 - Pi provider registration is replacement, not middleware. Decorate registered native **bases**, never effective composed providers; the latter loses legacy model headers and embeds stale configuration.
-- Decorate static legacy `streamSimple` owners without changing their callback receiver/configuration. For built-in/composed providers, lease the existing effective object's full and simple methods separately; never re-register that composed object. Preserve descriptors, make released leases permanently inert, and restore each still-owned method even after the provider is detached.
+- Share each native, legacy or effective observer dispatcher across runtime sessions and separately loaded extension copies. Releasing a session removes only its listener; the final lease restores still-owned registration/method descriptors, including detached effective objects. `/fast` may release all leases over its legacy delegate.
+- Preserve callback receivers and full/simple semantics. Lease effective objects in place; never re-register them. Released callbacks stay inert.
 - Restore registration only while still owning the slot. Preserve intervening unrelated configuration changes. Never change full-stream semantics just to obtain a capture hook. A post-hook logical payload is not necessarily the final wire body (Codex cached WebSocket deltas).
-- Cached summaries validate the captured prefix and current projected coverage; opaque native substitutions cannot establish readable cache eligibility. Keep unknown lifetimes unknown and apply retention per request. Pre-expiry transactions are cached-only and must cancel rather than enter ordinary fallback.
+- Cached summaries validate the captured prefix and current projected coverage; opaque native substitutions cannot establish readable cache eligibility. Keep unknown lifetimes unknown and apply retention per request. Pre-expiry transactions are cached-only and must cancel rather than enter ordinary fallback. Recheck the companion's live ownership/input guard before paid stages and native transport dispatch, regardless of hook order; `isIdle()` is admission-only because compaction itself makes it false.
 
 ## Development
 

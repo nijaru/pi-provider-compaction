@@ -198,3 +198,26 @@ describe("Codex Remote V2 bridge", () => {
 		expect(result.usage.totalTokens).toBe(15);
 	});
 });
+
+for (const protocol of ["responses-compact", "remote-v2"] as const) for (const stage of ["start", "payload", "fetch"]) test(protocol + " revokes ownership before " + stage + " dispatch", async () => {
+	let current = stage !== "start";
+	let requests = 0;
+	const provider = {
+		stream(_model: unknown, _context: unknown, options: any) {
+			return asyncStream(async () => {
+				if (stage === "payload") current = false;
+				await options.onPayload({ model: directModel.id, input: [] });
+				if (stage === "fetch") current = false;
+				await options.fetch("https://fixture.invalid/responses", { method: "POST" });
+			});
+		},
+	} as any;
+	const result = await requestProviderCompaction({
+		provider, model: protocol === "remote-v2" ? codexModel : directModel, protocol,
+		context: normalizeContext({ messages: [] }), input: [],
+		signal: new AbortController().signal, isCurrent: () => current,
+		fetch: (async () => { requests++; return Response.json({ output: [checkpoint], usage: { input_tokens: 1, output_tokens: 1 } }); }) as unknown as typeof fetch,
+	}).catch((error) => error);
+	expect(requests).toBe(0);
+	expect(result).toMatchObject({ name: "AbortError" });
+});

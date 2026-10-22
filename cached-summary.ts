@@ -212,7 +212,10 @@ export async function cachedSummary(request: CachedRequest, context: ExtensionCo
 	try {
 		const response = await request.provider.streamSimple(request.model, normalizeContext({ messages: [...request.context.messages, { role: "user", content: summaryInstruction(request, boundary, instructions), timestamp: Date.now() }] }), {
 			...request.options, signal, maxRetries: 0,
-			maxTokens: Math.max(1, Math.min(request.model.maxTokens, Math.floor(preparation.settings.reserveTokens * 0.8))),
+			// reserveTokens is a compaction trigger, not a summary budget. Let the
+			// adapter use its model output limit and context clamp, as Pi does; do
+			// not inherit a one-token cache-warmer or caller-specific output cap.
+			maxTokens: undefined,
 			onPayload: (payload) => {
 				if (!current() || !requestCacheState(request).available) throw new Error("stale summary request");
 				const result = summaryPayload(request.payload, payload); checked = true; return result;

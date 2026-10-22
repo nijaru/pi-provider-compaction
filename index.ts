@@ -144,6 +144,13 @@ interface Active {
 	payloadModel?: string;
 }
 
+interface ExpiryAttempt {
+	sessionId: string;
+	cycle: string;
+	isCurrent(): boolean;
+	signal?: AbortSignal;
+}
+
 export default function (pi: ExtensionAPI): void {
 	// Evidence is deliberately process/session-local. A reload cannot prove unchanged
 	// hook/privacy policy, even if the visible summary text happens to match.
@@ -157,7 +164,7 @@ export default function (pi: ExtensionAPI): void {
 	let snapshot: Captured | undefined;
 	let cache: CachedRequest | undefined;
 	let summarizing = false;
-	let expiryAttempt = false;
+	let expiryAttempt: ExpiryAttempt | undefined;
 	let lastOutcome: { path: string; elapsedMs: number; usage?: Usage; reason?: string } | undefined;
 	let active: Active | undefined;
 	let pending: { details: NativeCompactionDetails; capture: Captured; summary: string } | undefined;
@@ -167,8 +174,9 @@ export default function (pi: ExtensionAPI): void {
 	let requestSequence = 0;
 	let captureStatus = "no request observed";
 	let compactionStatus = "not attempted in this runtime";
+	let fallbackReason: string | undefined;
 	const captureRejected = (reason: string) => { captureStatus = reason; };
-	const fallback = (reason: string) => { compactionStatus = `portable: ${reason}`; };
+	const fallback = (reason: string) => { fallbackReason = reason; compactionStatus = `portable: ${reason}`; };
 	pi.registerCommand("provider-compaction-status", {
 		description: "Show cache/native eligibility and measured compaction usage",
 		handler: async (_args, context) => {
@@ -178,7 +186,7 @@ export default function (pi: ExtensionAPI): void {
 			context.ui.notify(`Provider compaction\nObserver: ${observer?.isInstalled() ? "installed" : "unavailable for current registration"}\nCapture: ${captureStatus}\nCache: ${state.reason}; ${remaining}\nLast attempt: ${compactionStatus}${lastOutcome ? `\nOutcome: ${lastOutcome.path}, ${lastOutcome.elapsedMs}ms${usage ? `; input ${usage.input}, cache read ${usage.cacheRead}, write ${usage.cacheWrite}, output ${usage.output}; catalog cost $${usage.cost.total.toFixed(6)}` : "; usage unavailable"}${lastOutcome.reason ? `; ${lastOutcome.reason}` : ""}` : ""}`, "info");
 		},
 	});
-	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; cache = undefined; active = undefined; pending = undefined; captureStatus = "invalidated by lifecycle/history/policy change"; };
+	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; cache = undefined; active = undefined; pending = undefined; expiryAttempt = undefined; captureStatus = "invalidated by lifecycle/history/policy change"; };
 	const retire = () => {
 		invalidate();
 		const installed = observer;
@@ -204,14 +212,27 @@ export default function (pi: ExtensionAPI): void {
 		try { request.respond(cacheState(request.context as unknown as ExtensionContext)); } catch { /* Stale requester. */ }
 	});
 	const removeExpiry = pi.events.on("pi-provider-compaction:compact-before-expiry", (request) => {
-		if (!isObject(request) || !isObject(request.context) || typeof request.respond !== "function" || typeof request.run !== "function") return;
+		if (!isObject(request) || !isObject(request.context) || typeof request.respond !== "function" || typeof request.run !== "function" || typeof request.isCurrent !== "function") return;
 		const context = request.context as unknown as ExtensionContext;
-		const run = request.run as () => Promise<void>;
+		const run = request.run as () => Promise<boolean>;
+		const authorized = request.isCurrent as () => boolean;
 		const execute = async () => {
 			const state = cacheState(context);
-			if (expiryAttempt || !state.available || state.cycle !== request.cycle || state.expiresAt === undefined || Date.now() >= state.expiresAt || !context.isIdle() || context.hasPendingMessages()) return false;
-			expiryAttempt = true;
-			try { await run(); return true; } finally { expiryAttempt = false; }
+			if (expiryAttempt || !state.available || state.cycle !== request.cycle || state.expiresAt === undefined || Date.now() >= state.expiresAt || !context.isIdle() || context.hasPendingMessages() || !authorized()) return false;
+			const ticket = generation;
+			const attempt: ExpiryAttempt = {
+				sessionId: context.sessionManager.getSessionId(), cycle: state.cycle,
+				isCurrent: () => {
+					try {
+						return expiryAttempt === attempt && generation === ticket &&
+							context.sessionManager.getSessionId() === attempt.sessionId &&
+							!context.hasPendingMessages() && authorized();
+					} catch { return false; }
+				},
+			};
+			expiryAttempt = attempt;
+			try { return await run(); }
+			finally { if (expiryAttempt === attempt) expiryAttempt = undefined; }
 		};
 		request.respond(execute());
 	});
@@ -354,24 +375,36 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_before_compact", async (event, context) => {
 		const began = Date.now();
 		compactionStatus = "preparing compaction";
+		fallbackReason = undefined;
+		const attempt = expiryAttempt;
 		const capture = snapshot;
 		const cached = cacheState(context).available ? cache : undefined;
 		snapshot = undefined; cache = undefined; pending = undefined;
+		const cancelled = (usage?: Usage, reason = "compaction ownership or input changed") => {
+			lastOutcome = { path: attempt ? "expiry cancelled" : "cancelled", elapsedMs: Date.now() - began, usage, reason };
+			return { cancel: true as const };
+		};
 		const reject = (reason: string) => {
 			fallback(reason);
-			return expiryAttempt ? { cancel: true as const } : undefined;
+			return attempt ? cancelled(undefined, reason) : undefined;
 		};
+		// The provider may run before the companion's handler. Share its live
+		// ownership/input guard instead of paying for work that a later handler cancels.
+		if (attempt) {
+			if (event.reason !== "manual" || !attempt.isCurrent() || !cached || cached.cycle !== attempt.cycle || attempt.signal && attempt.signal !== event.signal) return reject("idle transaction no longer authorized");
+			attempt.signal = event.signal;
+		}
 		if ((!capture && !cached) || !context.model || generic(context) || event.signal.aborted) return reject("no eligible snapshot, explicit model override, or aborted attempt");
 		const ticket = generation;
 		const branch = context.sessionManager.getBranch();
 		const branchHash = digest(branch);
 		const source = cached ?? capture!;
 		if (context.sessionManager.getSessionId() !== source.sessionId || !equal(branch, event.branchEntries) || !unchanged(branch, source.branchLength, source.branchHash)) return reject("history/session changed since capture");
-		const current = () => ticket === generation && !event.signal.aborted && supportedRouteOptions(source.model, source.options) && !generic(context) &&
+		const current = () => ticket === generation && !event.signal.aborted && (!attempt || attempt.isCurrent()) && supportedRouteOptions(source.model, source.options) && !generic(context) &&
 			context.model?.id === source.model.id && context.model?.provider === source.model.provider && context.model?.api === source.model.api &&
 			observer?.isInstalled() === true && context.modelRegistry.getProvider(source.model.provider) === source.provider && unchanged(context.sessionManager.getBranch(), branch.length, branchHash);
 		const auth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
-		if (!current()) return { cancel: true };
+		if (!current()) return cancelled();
 		if (!auth.ok || routeDigest(auth) !== source.authHash) return reject("auth changed since capture");
 		const protocol = capture ? resolveNativeProtocol(context.model) : undefined;
 		let input: ResponseItem[] | undefined;
@@ -394,50 +427,47 @@ export default function (pi: ExtensionAPI): void {
 				summaryReason = result.reason;
 				if (portable) summaryPath = "cached";
 			} finally { summarizing = false; }
-			if (!current()) return { cancel: true };
+			if (!current()) return cancelled(attemptedUsage);
 		}
 		if (!portable) {
-			if (expiryAttempt) {
-				lastOutcome = { path: "expiry cancelled", elapsedMs: Date.now() - began, usage: attemptedUsage, reason: summaryReason ?? "warm cache unavailable" };
-				return reject(lastOutcome.reason!);
-			}
+			if (attempt) return cancelled(attemptedUsage, summaryReason ?? "warm cache unavailable");
 			// Without native coverage or a dispatched cached attempt, Pi can own fallback.
-			if (!input && !attemptedUsage) return reject(summaryReason ?? (compactionStatus.startsWith("portable: ") ? compactionStatus.slice("portable: ".length) : "native coverage unavailable"));
+			if (!input && !attemptedUsage) return reject(summaryReason ?? fallbackReason ?? "native coverage unavailable");
 			compactionStatus = "generating portable summary";
 			try {
 				portable = await compact(event.preparation, source.model, auth.apiKey, auth.headers as Record<string, string> | undefined, event.customInstructions, event.signal, context.thinkingLevel, source.provider.streamSimple.bind(source.provider), auth.env, undefined, undefined, source.sessionId);
 				portable = withFileTracking(portable, event.preparation);
 				portable.usage = combineUsage(attemptedUsage, portable.usage);
 			} catch {
-				if (!current()) return { cancel: true };
+				if (!current()) return cancelled(attemptedUsage);
 				return reject("portable summary generation failed");
 			}
 		}
-		if (!current() || !portable.summary.trim() || portable.summary === NATIVE_COMPACTION_SUMMARY) return { cancel: true };
+		if (!current() || !portable.summary.trim() || portable.summary === NATIVE_COMPACTION_SUMMARY) return cancelled(portable.usage);
 		const outcome = (path: string, result: typeof portable, reason?: string) => {
 			lastOutcome = { path, elapsedMs: Date.now() - began, usage: result!.usage, reason };
 			result!.details = { ...(isObject(result!.details) ? result!.details : {}), providerCompaction: lastOutcome };
 			return { compaction: result! };
 		};
 		if (!capture || !protocol || !input) {
-			compactionStatus = `portable: ${summaryPath} summary`;
+			compactionStatus = `${summaryPath} portable summary prepared`;
 			return outcome(summaryPath, portable, summaryReason);
 		}
 		try {
 			const freshAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
-			if (!current()) return { cancel: true };
+			if (!current()) return cancelled(portable.usage);
 			if (!freshAuth.ok || routeDigest(freshAuth) !== capture.authHash) { fallback("auth changed after portable generation"); return outcome(summaryPath, portable, "native auth changed"); }
 			compactionStatus = "requesting native checkpoint";
 			const native = await requestProviderCompaction({
 				provider: capture.provider, model: capture.model, context: capture.prepared.context,
 				input, preparedPayload: capture.prepared.payload, protocol,
 				apiKey: capture.options.apiKey, headers: capture.options.headers, env: capture.options.env,
-				signal: event.signal, fetch: capture.options.fetch,
+				signal: event.signal, isCurrent: current, fetch: capture.options.fetch,
 				...(capture.options.serviceTier === undefined ? {} : { serviceTier: capture.options.serviceTier }),
 			});
-			if (!current()) return { cancel: true };
+			if (!current()) return cancelled(combineUsage(native.usage, portable.usage));
 			const finalAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
-			if (!current()) return { cancel: true };
+			if (!current()) return cancelled(combineUsage(native.usage, portable.usage));
 			if (!finalAuth.ok || routeDigest(finalAuth) !== capture.authHash) { fallback("auth changed after native generation"); return outcome(summaryPath, portable, "native auth changed"); }
 			const details: NativeCompactionDetails = {
 				...(isObject(portable.details) ? portable.details : {}),
@@ -450,21 +480,24 @@ export default function (pi: ExtensionAPI): void {
 			pending = { details: result.compaction.details as NativeCompactionDetails, capture, summary: portable.summary };
 			return result;
 		} catch (error) {
-			if (!current()) return { cancel: true };
+			if (!current()) return cancelled(error instanceof NativeCompactionValidationError ? combineUsage(error.usage, portable.usage) : portable.usage);
 			fallback("native acquisition or validation failed");
 			if (error instanceof NativeCompactionValidationError && error.usage !== undefined) portable.usage = combineUsage(error.usage, portable.usage);
 			return outcome(summaryPath, portable, "native acquisition or validation failed");
 		}
 	});
 	pi.on("session_compact", (event, context) => {
-		if (readNativeCompactionDetails(event.compactionEntry.details)?.version === 3) compactionStatus = "native checkpoint committed";
-		else if (!compactionStatus.startsWith("portable:")) fallback("another handler supplied the committed result");
 		const recorded = isObject(event.compactionEntry.details) ? event.compactionEntry.details.providerCompaction : undefined;
-		if (isObject(recorded)) {
+		const owned = isObject(recorded) && equal(recorded, lastOutcome);
+		if (readNativeCompactionDetails(event.compactionEntry.details)?.version === 3) compactionStatus = "native checkpoint committed";
+		else if (fallbackReason) compactionStatus = `portable: ${fallbackReason}`;
+		else if (owned) compactionStatus = `${lastOutcome!.path} portable summary committed`;
+		else fallback("another handler supplied the committed result");
+		if (owned) {
 			if (configuration().outcomeNotifications && lastOutcome) context.ui.notify(`Compacted via ${lastOutcome.path} in ${(lastOutcome.elapsedMs / 1000).toFixed(1)}s${lastOutcome.usage ? `; cache read ${lastOutcome.usage.cacheRead}, write ${lastOutcome.usage.cacheWrite}; catalog cost $${lastOutcome.usage.cost.total.toFixed(6)}` : ""}`, "info");
 		} else lastOutcome = { path: "Pi/other handler", elapsedMs: 0, usage: event.compactionEntry.usage, reason: compactionStatus };
 		// Only static diagnostics are persisted, never request/auth data or error text.
-		if (compactionStatus.startsWith("portable:")) pi.appendEntry("pi-provider-compaction:diagnostic", { status: compactionStatus });
+		if (fallbackReason) pi.appendEntry("pi-provider-compaction:diagnostic", { status: `portable: ${fallbackReason}` });
 		active = undefined; snapshot = undefined; cache = undefined;
 		const candidate = pending; pending = undefined;
 		if (!candidate || !equal(event.compactionEntry.details, candidate.details) || event.compactionEntry.summary !== candidate.summary) return;

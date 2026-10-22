@@ -228,7 +228,13 @@ interface TransportRequest {
 	/** Cost-relevant request option captured with the original request. */
 	serviceTier?: string;
 	signal: AbortSignal;
+	/** Revalidate request ownership after asynchronous provider preparation. */
+	isCurrent?: () => boolean;
 	fetch?: typeof globalThis.fetch;
+}
+
+function assertCurrent(request: TransportRequest): void {
+	if (request.signal.aborted || request.isCurrent?.() === false) throw new DOMException("Compaction invalidated", "AbortError");
 }
 
 /** The provider answered and was billed, but its window cannot be committed. */
@@ -251,7 +257,7 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 	let dispatches = 0;
 	const baseFetch = request.fetch ?? globalThis.fetch;
 	const bridgeFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-		if (request.signal.aborted) throw new DOMException("Compaction aborted", "AbortError");
+		assertCurrent(request);
 		dispatches += 1;
 		if (dispatches !== 1 || !preparedPayload) {
 			bridgeError = new Error("Responses Compact provider dispatched an unexpected additional request");
@@ -292,6 +298,7 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 		maxRetries: 0,
 		fetch: bridgeFetch,
 		onPayload: (payload: unknown) => {
+			assertCurrent(request);
 			if (!isObject(payload)) throw new Error("Responses provider exposed a non-object payload");
 			if (request.preparedPayload && request.preparedPayload.model !== payload.model) throw new Error("Native route model changed since capture");
 			preparedPayload = { ...structuredClone(request.preparedPayload ?? payload), input: structuredClone(request.input) };
@@ -408,6 +415,7 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 	const signal = AbortSignal.any([request.signal, controller.signal]);
 	const inspections: Promise<{ result: CollectedSse } | { error: unknown }>[] = [];
 	const inspectedFetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+		assertCurrent(request);
 		const response = await baseFetch(input, init);
 		if (!response.ok || !response.body) return response;
 		const [providerBody, inspectionBody] = response.body.tee();
@@ -432,6 +440,7 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 		maxRetries: 0,
 		fetch: inspectedFetch,
 		onPayload: (payload: unknown) => {
+			assertCurrent(request);
 			if (!isObject(payload)) throw new Error("Codex provider exposed a non-object payload");
 			sentInput = structuredClone(request.input);
 			if (request.preparedPayload && request.preparedPayload.model !== payload.model) throw new Error("Native route model changed since capture");
@@ -452,6 +461,7 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 export async function requestProviderCompaction(
 	request: TransportRequest & { protocol: NativeProtocol },
 ): Promise<TransportResponse> {
+	assertCurrent(request);
 	const result = await (request.protocol === "remote-v2" ? requestRemoteV2(request) : requestResponsesCompact(request));
 	try {
 		return { ...result, output: validateCompactedOutput(result) };

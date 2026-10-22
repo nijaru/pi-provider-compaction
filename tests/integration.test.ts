@@ -38,7 +38,7 @@ async function loadExternalExtension(path: string): Promise<(pi: ExtensionAPI) =
 	return (await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`)).default;
 }
 
-async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean; cached?: boolean; cacheTtl?: number; settings?: Record<string, unknown>; beforeReply?: (body: any) => void; builtin?: string; summaryLength?: boolean; seed?: (manager: SessionManager, model: Model<any>) => void } = {}) {
+async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; firstHooks?: (pi: ExtensionAPI) => void; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean; cached?: boolean; cacheTtl?: number; settings?: Record<string, unknown>; beforeReply?: (body: any) => void; builtin?: string; summaryLength?: boolean; minimumSummaryTokens?: number; seed?: (manager: SessionManager, model: Model<any>) => void } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "provider-compaction-fixture-"));
 	const requests: { url: string; body: any; headers: Headers }[] = [];
 	const authControl: { key: string; beforeResolve?: () => void; beforeNative?: () => void } = { key: "fixture" };
@@ -54,7 +54,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 			const response = { id: "resp_native", status: "completed", output: [checkpoint], usage };
 			return new Response(`data: ${JSON.stringify({ type: "response.completed", response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
 		}
-		options.beforeReply?.(body);
+		await options.beforeReply?.(body);
 		if (options.api === "openai-completions") {
 			const chunks = [{ choices: [{ index: 0, delta: { role: "assistant", content: "Portable summary fixture" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24, prompt_tokens_details: { cached_tokens: options.cached ? 15 : 0 } } }];
 			return new Response(chunks.map((chunk) => `data: ${JSON.stringify({ id: "chatcmpl_fixture", model: "fixture", ...chunk })}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
@@ -63,7 +63,10 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 			const events = [{ type: "message_start", message: { id: "msg_fixture", type: "message", role: "assistant", model: "fixture", content: [], usage: { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: options.cached ? 15 : 0 } } }, { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Portable summary fixture" } }, { type: "content_block_stop", index: 0 }, { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } }, { type: "message_stop" }];
 			return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 		}
-		return completion("Portable summary fixture", options.cached, options.summaryLength && JSON.stringify(body).includes("retained-boundary"));
+		const summary = JSON.stringify(body).includes("Write a portable context checkpoint");
+		const cap = body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
+		const truncated = options.summaryLength && JSON.stringify(body).includes("retained-boundary") || summary && options.minimumSummaryTokens !== undefined && typeof cap === "number" && cap < options.minimumSummaryTokens;
+		return completion("Portable summary fixture", options.cached, truncated);
 	}) as typeof fetch;
 	const model: Model<any> = { provider: options.builtin ?? (options.fastFactory ? "openai-codex" : "fixture"), api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-5.5" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: options.thinking ?? false, ...(options.cacheTtl ? { promptCache: { short: options.cacheTtl, long: options.cacheTtl * 2 } } : {}), compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 	const credentials = new InMemoryCredentialStore();
@@ -82,7 +85,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 		cwd: directory, agentDir: directory, settingsManager: settings, modelRuntime: runtime, extensionFlagValues: options.flagValues,
 		resourceLoaderOptions: {
 			noExtensions: true, noSkills: true, noPromptTemplates: true, noThemes: true, noContextFiles: true, systemPrompt: "Fixture policy",
-			extensionFactories: [...(options.fastFactory ? [options.fastFactory] : []), ...(options.hooksFirst ? hooks : []), extension, ...(!options.hooksFirst ? hooks : [])],
+			extensionFactories: [...(options.firstHooks ? [options.firstHooks] : []), ...(options.fastFactory ? [options.fastFactory] : []), ...(options.hooksFirst ? hooks : []), extension, ...(!options.hooksFirst ? hooks : [])],
 		},
 	});
 	const { session } = await createAgentSessionFromServices({ services, model, thinkingLevel: options.thinking ? "low" : undefined, sessionManager: manager, tools: [] });
@@ -518,6 +521,19 @@ describe("Pi runner + real Responses adapter", () => {
 });
 
 describe("cached portable summaries", () => {
+	test.each([0, 100, 16384])("summary output is independent of reserveTokens=%s", async (reserveTokens) => {
+		const f = await fixture({ cached: true, minimumSummaryTokens: 128, settings: { compaction: { enabled: false, keepRecentTokens: 40, reserveTokens } } });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const before = f.requests.length;
+			const result = await f.session.compact();
+			expect((result.details as any).providerCompaction.path).toBe("cached + native");
+			expect(f.requests).toHaveLength(before + 2);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+
 	test.each([false, true])("reuses final prompt prefix and keeps native acquisition single (thinking=%s)", async (thinking) => {
 		const f = await fixture({ cached: true, cacheTtl: 300, thinking });
 		try {
@@ -552,6 +568,7 @@ describe("cached portable summaries", () => {
 			const result = await f.session.compact();
 			const summary = f.requests.at(-1)!.body;
 			expect((result.details as any).providerCompaction.path).toBe("cached");
+			expect(f.manager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toHaveLength(0);
 			expect(f.requests).toHaveLength(before + 1);
 			expect(summary.messages[0]).toEqual(previous.messages[0]);
 			expect(JSON.stringify(summary)).toContain("retained-boundary");
@@ -597,7 +614,7 @@ describe("cached portable summaries", () => {
 			if (expiry) {
 				let state: any, promise: Promise<boolean> | undefined;
 				bus.emit("pi-provider-compaction:cache-state", { context, respond: (value: any) => { state = value; } });
-				bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: state.cycle, run: async () => { await f.session.compact(); }, respond: (value: Promise<boolean>) => { promise = value; } });
+				bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: state.cycle, isCurrent: () => true, run: async () => { await f.session.compact(); return true; }, respond: (value: Promise<boolean>) => { promise = value; } });
 				await expect(promise).rejects.toThrow();
 				expect(f.requests).toHaveLength(before + 1);
 				expect(f.manager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
@@ -653,10 +670,10 @@ describe("cached portable summaries", () => {
 			await f.session.prompt("B ".repeat(100));
 			let state: any; bus.emit("pi-provider-compaction:cache-state", { context, respond: (value: any) => { state = value; } });
 			let promise: Promise<boolean> | undefined, invoked = false;
-			bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: "stale", run: async () => { invoked = true; }, respond: (value: Promise<boolean>) => { promise = value; } });
+			bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: "stale", isCurrent: () => true, run: async () => { invoked = true; return true; }, respond: (value: Promise<boolean>) => { promise = value; } });
 			expect(await promise).toBe(false); expect(invoked).toBe(false);
 			const before = f.requests.length;
-			bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: state.cycle, run: async () => { await f.session.compact(); }, respond: (value: Promise<boolean>) => { promise = value; } });
+			bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: state.cycle, isCurrent: () => true, run: async () => { await f.session.compact(); return true; }, respond: (value: Promise<boolean>) => { promise = value; } });
 			expect(await promise).toBe(true);
 			expect(f.requests).toHaveLength(before + 2);
 			expect(f.errors).toEqual([]);
@@ -666,9 +683,9 @@ describe("cached portable summaries", () => {
 
 for (const hooksFirst of [false, true]) test.skipIf(!process.env.PI_COMPACTOR_FIXTURE_PATH)(`real companion schedules one cached expiry transaction (compactor first=${hooksFirst})`, async () => {
 	const f = await fixture({
-		cached: true, cacheTtl: 2, hooksFirst,
+		cached: true, cacheTtl: 2, minimumSummaryTokens: 128, hooksFirst,
 		hooks: await loadExternalExtension(process.env.PI_COMPACTOR_FIXTURE_PATH!),
-		settings: { compactor: { compactBeforeExpiry: true, minContextTokens: 0, leadTimeSeconds: 1 }, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 40 } },
+		settings: { compactor: { compactBeforeExpiry: true, minContextTokens: 0, leadTimeSeconds: 1 }, compaction: { enabled: true, reserveTokens: 0, keepRecentTokens: 40 } },
 	});
 	try {
 		await f.session.prompt("A ".repeat(1000));
@@ -685,4 +702,66 @@ for (const hooksFirst of [false, true]) test.skipIf(!process.env.PI_COMPACTOR_FI
 		expect(f.manager.getBranch().some((entry) => entry.type === "custom_message")).toBe(false);
 		expect(f.errors).toEqual([]);
 	} finally { await f.close(); }
+});
+
+for (const hooksFirst of [false, true]) test.skipIf(!process.env.PI_COMPACTOR_FIXTURE_PATH)("queued input cancels expiry before paid work, compactor first=" + hooksFirst, async () => {
+	let gate = false;
+	let entered!: () => void, release!: () => void;
+	const started = new Promise<void>((resolve) => { entered = resolve; });
+	const released = new Promise<void>((resolve) => { release = resolve; });
+	const f = await fixture({
+		cached: true, cacheTtl: 2, hooksFirst,
+		hooks: await loadExternalExtension(process.env.PI_COMPACTOR_FIXTURE_PATH!),
+		firstHooks(pi) { pi.on("session_before_compact", async () => { if (gate) { entered(); await released; } }); },
+		settings: { compactor: { compactBeforeExpiry: true, minContextTokens: 0, leadTimeSeconds: 1 }, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 40 } },
+	});
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await f.session.prompt("A ".repeat(1000));
+		await f.session.prompt("B ".repeat(100));
+		const before = f.requests.length;
+		const ended = new Promise<any>((resolve) => { f.session.subscribe((event) => { if (event.type === "compaction_end") resolve(event); }); });
+		gate = true;
+		await Promise.race([started, new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Expiry did not start")), 3000); })]);
+		await f.session.followUp("Queued input must take priority over idle maintenance.");
+		release();
+		const outcome = await ended;
+		expect(outcome.aborted).toBe(true);
+		expect(f.requests).toHaveLength(before);
+		expect(f.manager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(0);
+		expect(f.session.getFollowUpMessages()).toHaveLength(1);
+		expect(f.errors).toEqual([]);
+	} finally { clearTimeout(timer); release(); await f.close(); }
+});
+
+for (const hooksFirst of [false, true]) test.skipIf(!process.env.PI_COMPACTOR_FIXTURE_PATH)("queued input during summary prevents native work, compactor first=" + hooksFirst, async () => {
+	const f = await fixture({
+		cached: true, cacheTtl: 2, hooksFirst,
+		hooks: await loadExternalExtension(process.env.PI_COMPACTOR_FIXTURE_PATH!),
+		async beforeReply(body) {
+			if (JSON.stringify(body).includes("Write a portable context checkpoint")) await f.session.followUp("New user work arrived while the summary was in flight.");
+		},
+		settings: { compactor: { compactBeforeExpiry: true, minContextTokens: 0, leadTimeSeconds: 1 }, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 40 } },
+	});
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		await f.session.prompt("A ".repeat(1000));
+		await f.session.prompt("B ".repeat(100));
+		const before = f.requests.length;
+		const outcome = await Promise.race([
+			new Promise<any>((resolve) => { f.session.subscribe((event) => { if (event.type === "compaction_end") resolve(event); }); }),
+			new Promise((_, reject) => { timer = setTimeout(() => reject(new Error("Expiry did not finish")), 3000); }),
+		]);
+		expect(outcome.aborted).toBe(true);
+		expect(f.requests).toHaveLength(before + 1);
+		const notices: string[] = [];
+		const context = f.session.extensionRunner.createCommandContext();
+		await f.session.extensionRunner.getCommand("provider-compaction-status")!.handler("", { ...context, ui: { ...context.ui, notify: (message) => { notices.push(message); } } });
+		expect(notices[0]).toContain("Outcome: expiry cancelled");
+		expect(notices[0]).toContain("cache read 15");
+		expect(f.requests.slice(before).some((request) => request.url.endsWith("/compact"))).toBe(false);
+		expect(f.manager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+		expect(f.session.getFollowUpMessages()).toHaveLength(1);
+		expect(f.errors).toEqual([]);
+	} finally { clearTimeout(timer); await f.close(); }
 });
