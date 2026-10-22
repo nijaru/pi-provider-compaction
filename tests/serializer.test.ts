@@ -37,7 +37,7 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 		expect(payload.input.some((item: any) => item.type === "custom_tool_call_output")).toBe(true);
 		expect(capturePreparedRequest(model, context, context, payload)).toBeDefined();
 		if (api === "openai-codex-responses") expect(payload.instructions).toContain("forced policy");
-		else expect(payload.input[0].content).toContain("forced policy");
+		else expect(payload.input).toContainEqual(expect.objectContaining({ role: "developer", content: expect.stringContaining("forced policy") }));
 		const snapshot = capturePreparedRequest(model, context, context, payload)!;
 		const split = normalizeContext({ messages: context.messages.slice(0, 3) });
 		expect(selectCoveredPrefix(model, snapshot, split)).toBeUndefined();

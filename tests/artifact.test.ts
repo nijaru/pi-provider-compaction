@@ -12,8 +12,8 @@ const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0
 const grammar: Tool = { name: "edit", description: "Edit", parameters: Type.Object({ input: Type.String() }), constrainedSampling: { type: "grammar", variants: { openai_lark: "start: /.+/" } } };
 
 for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-responses", azure], ["openai-codex-responses", codex]] as const) {
-	for (const crossModel of [false, true]) test(`${api}: built artifact captures ${crossModel ? "cross-model ctc_*" : "same-model fc_* promoted to grammar"} history`, async () => {
-		const model: Model<any> = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : "azure", id: "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, contextWindow: 100000, maxTokens: 1000, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true, supportsMidConvoEffort: api === "openai-responses" } };
+	for (const mid of [false, true]) for (const crossModel of [false, true]) test(`${api}: built artifact captures ${crossModel ? "cross-model ctc_*" : "same-model fc_* promoted to grammar"} history (mid=${mid})`, async () => {
+		const model: Model<any> = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : "azure", id: "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, contextWindow: 100000, maxTokens: 1000, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: mid, supportsAdditionalTools: mid, supportsMidConvoEffort: api === "openai-responses" } };
 		const id = crossModel ? "call_A|ctc_A" : "call_A|fc_A";
 		const context = normalizeContext({ systemPrompt: "policy", tools: [grammar], messages: [
 			{ role: "user", content: "Edit A", timestamp: 1 },
