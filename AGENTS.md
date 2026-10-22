@@ -1,6 +1,6 @@
 # pi-provider-compaction
 
-Experimental provider-native compaction; the minimum runtime remains Pi 0.87.0. Keep global activation and publishing separate from development validation.
+Experimental cached and provider-native compaction; the minimum runtime remains Pi 0.87.0. Keep global activation and publishing separate from development validation.
 
 ## Product boundaries
 
@@ -23,11 +23,12 @@ Experimental provider-native compaction; the minimum runtime remains Pi 0.87.0. 
 ## Provider ownership
 
 - Pi provider registration is replacement, not middleware. Decorate registered native **bases**, never effective composed providers; the latter loses legacy model headers and embeds stale configuration.
-- Only decorate existing static legacy `streamSimple` owners. Preserve their callback receiver and all configuration. Exclude dynamic legacy catalogs/OAuth model projections and unregistered builtin overlays.
-- Restore registration only while still owning the slot. Preserve intervening unrelated configuration changes. Never change full-stream semantics just to obtain a capture hook.
+- Decorate static legacy `streamSimple` owners without changing their callback receiver/configuration. For built-in/composed providers, lease the existing effective object's full and simple methods separately; never re-register that composed object. Preserve descriptors, make released leases permanently inert, and restore each still-owned method even after the provider is detached.
+- Restore registration only while still owning the slot. Preserve intervening unrelated configuration changes. Never change full-stream semantics just to obtain a capture hook. A post-hook logical payload is not necessarily the final wire body (Codex cached WebSocket deltas).
+- Cached summaries validate the captured prefix and current projected coverage; opaque native substitutions cannot establish readable cache eligibility. Keep unknown lifetimes unknown and apply retention per request. Pre-expiry transactions are cached-only and must cancel rather than enter ordinary fallback.
 
 ## Development
 
-Use Bun/TypeScript. Development dependencies pin the tested Pi host, not the minimum runtime floor. `index.ts` owns lifecycle and compaction; `provider.ts` owns capture-hook installation; `replay.ts` owns exact mapping and substitution; `protocol.ts` owns transport/validation; `policy.ts` mirrors generic-model precedence.
+Use Bun/TypeScript. Development dependencies pin the tested Pi host, not the minimum runtime floor. `index.ts` owns lifecycle and compaction; `provider.ts` owns capture-hook installation; `replay.ts` owns exact mapping and substitution; `protocol.ts` owns transport/validation; `policy.ts` mirrors generic-model precedence; `cached-summary.ts` owns cache evidence, summary validation and visible file-history carry-forward.
 
 Run `bun run check`, `bun run build`, and `git diff --check`. `check` rebuilds ignored `dist/index.js` before testing the artifact against the host serializer. The manifest loads that artifact, so rebuild after source or dependency changes before local Pi testing. Exercise real Pi runner/adapters with fake transports. Report authenticated backend tests separately; fixtures alone do not establish production readiness.

@@ -4,9 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { zstdDecompressSync } from "node:zlib";
 import { createProvider, InMemoryCredentialStore, normalizeContext, type Model } from "@earendil-works/pi-ai";
-import { createAgentSessionFromServices, createAgentSessionServices, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { createAgentSessionFromServices, createAgentSessionServices, convertToLlm, ModelRuntime, SessionManager, SettingsManager, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import extension from "../index";
 import { STREAM_OBSERVER } from "../provider";
+import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { azureOpenAIResponsesApi } from "@earendil-works/pi-ai/api/azure-openai-responses.lazy";
 import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-responses.lazy";
@@ -15,9 +17,9 @@ const originalFetch = globalThis.fetch;
 afterEach(() => { globalThis.fetch = originalFetch; });
 const checkpoint = { type: "compaction", encrypted_content: "native-prefix" };
 const usage = { input_tokens: 20, output_tokens: 4, total_tokens: 24 };
-function completion(text: string): Response {
+function completion(text: string, cached = false, truncated = false): Response {
 	const item = { type: "message", id: "msg_fixture", role: "assistant", status: "completed", content: [{ type: "output_text", text, annotations: [] }] };
-	const response = { id: "resp_fixture", status: "completed", output: [item], usage };
+	const response = { id: "resp_fixture", status: truncated ? "incomplete" : "completed", ...(truncated ? { incomplete_details: { reason: "max_output_tokens" } } : {}), output: [item], usage: cached ? { ...usage, input_tokens_details: { cached_tokens: 15 } } : usage };
 	const events = [
 		{ type: "response.created", response: { ...response, status: "in_progress", output: [] } },
 		{ type: "response.output_item.added", output_index: 0, item: { ...item, content: [] } },
@@ -36,7 +38,7 @@ async function loadExternalExtension(path: string): Promise<(pi: ExtensionAPI) =
 	return (await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`)).default;
 }
 
-async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean } = {}) {
+async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean; cached?: boolean; cacheTtl?: number; settings?: Record<string, unknown>; beforeReply?: (body: any) => void; builtin?: string; summaryLength?: boolean; seed?: (manager: SessionManager, model: Model<any>) => void } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "provider-compaction-fixture-"));
 	const requests: { url: string; body: any; headers: Headers }[] = [];
 	const authControl: { key: string; beforeResolve?: () => void; beforeNative?: () => void } = { key: "fixture" };
@@ -52,17 +54,29 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 			const response = { id: "resp_native", status: "completed", output: [checkpoint], usage };
 			return new Response(`data: ${JSON.stringify({ type: "response.completed", response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
 		}
-		return completion("Portable summary fixture");
+		options.beforeReply?.(body);
+		if (options.api === "openai-completions") {
+			const chunks = [{ choices: [{ index: 0, delta: { role: "assistant", content: "Portable summary fixture" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24, prompt_tokens_details: { cached_tokens: options.cached ? 15 : 0 } } }];
+			return new Response(chunks.map((chunk) => `data: ${JSON.stringify({ id: "chatcmpl_fixture", model: "fixture", ...chunk })}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
+		}
+		if (options.api === "anthropic-messages") {
+			const events = [{ type: "message_start", message: { id: "msg_fixture", type: "message", role: "assistant", model: "fixture", content: [], usage: { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: options.cached ? 15 : 0 } } }, { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Portable summary fixture" } }, { type: "content_block_stop", index: 0 }, { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } }, { type: "message_stop" }];
+			return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
+		}
+		return completion("Portable summary fixture", options.cached, options.summaryLength && JSON.stringify(body).includes("retained-boundary"));
 	}) as typeof fetch;
-	const model: Model<any> = { provider: options.fastFactory ? "openai-codex" : "fixture", api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-5.5" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: options.thinking ?? false, compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
-	const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath: null, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false });
-	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
+	const model: Model<any> = { provider: options.builtin ?? (options.fastFactory ? "openai-codex" : "fixture"), api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-5.5" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: options.thinking ?? false, ...(options.cacheTtl ? { promptCache: { short: options.cacheTtl, long: options.cacheTtl * 2 } } : {}), compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+	const credentials = new InMemoryCredentialStore();
+	if (options.builtin) await credentials.modify(model.provider, async () => ({ type: "api_key", key: "fixture" }));
+	const runtime = await ModelRuntime.create({ credentials, modelsPath: null, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false });
+	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "openai-completions" ? openAICompletionsApi() : options.api === "anthropic-messages" ? anthropicMessagesApi() : options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
 	const legacyStream = provider.streamSimple.bind(provider);
 	if (options.fastFactory) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`, models: [model] });
 	else if (options.legacy) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: "fixture", models: [model], streamSimple: legacyStream });
-	else runtime.registerNativeProvider(provider);
-	const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 40, reserveTokens: 1000 }, cacheWarming: "off" });
+	else if (!options.builtin) runtime.registerNativeProvider(provider);
+	const settings = SettingsManager.inMemory({ compaction: { enabled: false, keepRecentTokens: 40, reserveTokens: 1000 }, cacheWarming: "off", ...options.settings });
 	const manager = SessionManager.inMemory(directory);
+	options.seed?.(manager, model);
 	const hooks = options.hooks ? [options.hooks] : [];
 	const services = await createAgentSessionServices({
 		cwd: directory, agentDir: directory, settingsManager: settings, modelRuntime: runtime, extensionFlagValues: options.flagValues,
@@ -501,4 +515,174 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(JSON.stringify(f.requests.at(-1)!.body)).not.toContain("pi-provider-compaction:diagnostic");
 		} finally { await f.close(); }
 	});
+});
+
+describe("cached portable summaries", () => {
+	test.each([false, true])("reuses final prompt prefix and keeps native acquisition single (thinking=%s)", async (thinking) => {
+		const f = await fixture({ cached: true, cacheTtl: 300, thinking });
+		try {
+			await f.session.prompt("User constraint: do not deploy. " + "A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const prefix = f.requests.at(-1)!.body;
+			const before = f.requests.length;
+			const result = await f.session.compact();
+			const summary = f.requests.slice(before).find((request) => !request.url.endsWith("/compact"))!;
+			expect(summary.body.input.slice(0, prefix.input.length)).toEqual(prefix.input);
+			expect(summary.body.tools).toEqual(prefix.tools);
+			expect(summary.body.input.some((item: any) => JSON.stringify(item).includes("retained-boundary"))).toBe(true);
+			expect((result.details as any).providerCompaction.path).toBe("cached + native");
+			expect(f.requests).toHaveLength(before + 2);
+			expect(result.usage?.cacheRead).toBe(15);
+			await f.session.prompt("Continue unfinished work");
+			expect(f.requests.at(-1)!.body.input).toContainEqual(checkpoint);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+	test.each([
+		{ api: "openai-completions", builtin: "deepseek" },
+		{ api: "openai-completions", builtin: "xiaomi" },
+		{ api: "anthropic-messages" },
+	])("portable-only cached compaction uses the real $api adapter ($builtin)", async (options) => {
+		const f = await fixture({ ...options, cached: true });
+		try {
+			await f.session.prompt("User constraint: do not deploy. " + "A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const previous = f.requests.at(-1)!.body;
+			const before = f.requests.length;
+			const result = await f.session.compact();
+			const summary = f.requests.at(-1)!.body;
+			expect((result.details as any).providerCompaction.path).toBe("cached");
+			expect(f.requests).toHaveLength(before + 1);
+			expect(summary.messages[0]).toEqual(previous.messages[0]);
+			expect(JSON.stringify(summary)).toContain("retained-boundary");
+			expect(result.usage?.cacheRead).toBe(15);
+			await f.session.prompt("Continue unfinished work");
+			expect(f.errors).toEqual([]);
+			if (options.builtin) expect(f.runtime.getRegisteredNativeProvider(options.builtin)).toBeUndefined();
+		} finally { await f.close(); }
+	});
+	test("a retained assistant outside the capture is not pulled into the summary", async () => {
+		const f = await fixture({ cached: true, builtin: "deepseek", api: "openai-completions", settings: { compaction: { enabled: false, reserveTokens: 1000, keepRecentTokens: 1 } } });
+		try {
+			await f.session.prompt("Preserve this task history. " + "A ".repeat(1000));
+			const result = await f.session.compact();
+			expect((result.details as any).providerCompaction.path).toBe("cached");
+			expect(JSON.stringify(f.requests.at(-1)!.body)).toContain("first retained message is outside this request");
+			const kept = f.manager.getBranch().find((entry) => entry.id === result.firstKeptEntryId);
+			expect(kept?.type === "message" && kept.message.role).toBe("assistant");
+		} finally { await f.close(); }
+	});
+	test("cached summaries see late tool output that ordinary serialization clips", async () => {
+		const marker = "LATE_CALIBRATION_Z92Q";
+		const f = await fixture({ cached: true, builtin: "deepseek", api: "openai-completions", seed(manager, model) {
+			manager.appendMessage({ role: "user", content: "Read fixture.txt; preserve its final calibration value. Do not deploy.", timestamp: 1 });
+			manager.appendMessage({ role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "toolCall", id: "read-fixture", name: "read", arguments: { path: "fixture.txt" } }], stopReason: "toolUse", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: 2 });
+			manager.appendMessage({ role: "toolResult", toolCallId: "read-fixture", toolName: "read", content: [{ type: "text", text: "padding ".repeat(1000) + marker }], isError: false, timestamp: 3 });
+			manager.appendMessage({ role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "text", text: "File loaded." }], stopReason: "stop", usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } }, timestamp: 4 });
+		} });
+		try {
+			await f.session.prompt("Retain this new work verbatim: " + "B ".repeat(100));
+			const result = await f.session.compact();
+			expect((result.details as any).providerCompaction.path).toBe("cached");
+			expect(JSON.stringify(f.requests.at(-1)!.body)).toContain(marker);
+			expect((result.details as any).readFiles).toEqual(["fixture.txt"]);
+		} finally { await f.close(); }
+	});
+	test.each([false, true])("incomplete cached output has one accounted fallback, or cancels expiry (expiry=%s)", async (expiry) => {
+		let context: any, bus: any;
+		const f = await fixture({ cached: true, summaryLength: true, cacheTtl: 300, hooks(pi) { bus = pi.events; pi.on("agent_settled", (_event, ctx) => { context = ctx; }); } });
+		try {
+			await f.session.prompt("A ".repeat(1000)); await f.session.prompt("B ".repeat(100));
+			const before = f.requests.length;
+			if (expiry) {
+				let state: any, promise: Promise<boolean> | undefined;
+				bus.emit("pi-provider-compaction:cache-state", { context, respond: (value: any) => { state = value; } });
+				bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: state.cycle, run: async () => { await f.session.compact(); }, respond: (value: Promise<boolean>) => { promise = value; } });
+				await expect(promise).rejects.toThrow();
+				expect(f.requests).toHaveLength(before + 1);
+				expect(f.manager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+			} else {
+				const result = await f.session.compact();
+				expect(f.requests).toHaveLength(before + 3);
+				expect((result.details as any).providerCompaction.path).toBe("standard + native");
+				expect(result.usage?.cacheRead).toBe(30);
+			}
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+	test("a successful one-token warmer refreshes cache evidence and keeps summary coverage", async () => {
+		let context: any, sent: any, bus: any;
+		const f = await fixture({ cached: true, cacheTtl: 300, builtin: "deepseek", api: "openai-completions", hooks(pi) {
+			bus = pi.events;
+			pi.on("context_with_system", (event) => { sent = normalizeContext({ messages: convertToLlm(event.messages) }); });
+			pi.on("agent_settled", (_event, ctx) => { context = ctx; });
+		} });
+		const query = () => { let state: any; bus.emit("pi-provider-compaction:cache-state", { context, respond: (value: any) => { state = value; } }); return state; };
+		try {
+			await f.session.prompt("A ".repeat(1000)); await f.session.prompt("B ".repeat(100));
+			const before = query();
+			await new Promise((resolve) => setTimeout(resolve, 5));
+			await f.runtime.streamSimple(f.session.model!, sent, { sessionId: f.manager.getSessionId(), maxTokens: 1, onPayload: () => undefined }).result();
+			const after = query();
+			expect(after.available).toBe(true);
+			expect(after.cycle).not.toBe(before.cycle);
+			expect(after.expiresAt).toBeGreaterThan(before.expiresAt);
+			const result = await f.session.compact();
+			expect((result.details as any).providerCompaction.path).toBe("cached");
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+	test("unknown cache lifetime remains unknown but manual cached summarization is available", async () => {
+		let query: (() => any) | undefined;
+		const f = await fixture({ cached: true, hooks(pi) { pi.on("agent_settled", (_event, ctx) => {
+			query = () => { let state: any; pi.events.emit("pi-provider-compaction:cache-state", { context: ctx, respond: (value: any) => { state = value; } }); return state; };
+		}); } });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			expect(query!()).toMatchObject({ available: true, expiresAt: undefined });
+			const result = await f.session.compact();
+			expect((result.details as any).providerCompaction.path).toBe("cached + native");
+		} finally { await f.close(); }
+	});
+	test("expiry requests require the current cache cycle", async () => {
+		let context: any, bus: any;
+		const f = await fixture({ cached: true, cacheTtl: 300, hooks(pi) { bus = pi.events; pi.on("agent_settled", (_event, ctx) => { context = ctx; }); } });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			let state: any; bus.emit("pi-provider-compaction:cache-state", { context, respond: (value: any) => { state = value; } });
+			let promise: Promise<boolean> | undefined, invoked = false;
+			bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: "stale", run: async () => { invoked = true; }, respond: (value: Promise<boolean>) => { promise = value; } });
+			expect(await promise).toBe(false); expect(invoked).toBe(false);
+			const before = f.requests.length;
+			bus.emit("pi-provider-compaction:compact-before-expiry", { context, cycle: state.cycle, run: async () => { await f.session.compact(); }, respond: (value: Promise<boolean>) => { promise = value; } });
+			expect(await promise).toBe(true);
+			expect(f.requests).toHaveLength(before + 2);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+});
+
+for (const hooksFirst of [false, true]) test.skipIf(!process.env.PI_COMPACTOR_FIXTURE_PATH)(`real companion schedules one cached expiry transaction (compactor first=${hooksFirst})`, async () => {
+	const f = await fixture({
+		cached: true, cacheTtl: 2, hooksFirst,
+		hooks: await loadExternalExtension(process.env.PI_COMPACTOR_FIXTURE_PATH!),
+		settings: { compactor: { compactBeforeExpiry: true, minContextTokens: 0, leadTimeSeconds: 1 }, compaction: { enabled: true, reserveTokens: 1000, keepRecentTokens: 40 } },
+	});
+	try {
+		await f.session.prompt("A ".repeat(1000));
+		await f.session.prompt("B ".repeat(100));
+		const before = f.requests.length;
+		const deadline = Date.now() + 3000;
+		while (!f.manager.getBranch().some((entry) => entry.type === "compaction") && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 20));
+		expect(f.manager.getBranch().filter((entry) => entry.type === "compaction")).toHaveLength(1);
+		const saved = f.manager.getBranch().find((entry) => entry.type === "compaction")!;
+		expect(saved.type === "compaction" && (saved.details as any).providerCompaction.path).toBe("cached + native");
+		expect(f.requests).toHaveLength(before + 2);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(f.requests).toHaveLength(before + 2);
+		expect(f.manager.getBranch().some((entry) => entry.type === "custom_message")).toBe(false);
+		expect(f.errors).toEqual([]);
+	} finally { await f.close(); }
 });

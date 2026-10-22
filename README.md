@@ -1,18 +1,18 @@
 # pi-provider-compaction
 
-Experimental provider-native compaction for [Pi](https://github.com/earendil-works/pi), with a meaningful portable summary saved alongside each native checkpoint. Minimum runtime: Pi 0.87.0. Development checks target Pi 1.4.0.
+Experimental cache-aware compaction for [Pi](https://github.com/earendil-works/pi), with portable summaries and optional provider-native checkpoints. Minimum runtime: Pi 0.87.0. Development checks target Pi 1.4.0.
 
 **This experimental design is not production-validated. Do not enable it globally yet.** Real runner/adapter fixtures and a Codex live smoke test pass; broader backend and deployment validation remains incomplete.
 
-[pi-compactor](https://github.com/nijaru/pi-compactor) owns compaction timing and continuation. This extension owns native request capture, prefix coverage, persistence and replay. It does not change `/fast` or account reporting.
+[pi-compactor](https://github.com/nijaru/pi-compactor) owns compaction timing and continuation. This extension owns cached summary generation, native request capture, prefix coverage, persistence and replay. It does not change `/fast` or account reporting.
 
 ## Supported integration
 
 Pi has replacement provider registration, not composable middleware. This extension only installs request observation where it can preserve the existing provider contract:
 
 - **Registered native base providers:** both streaming methods are decorated; authentication, catalogs, filtering, refresh and deferred methods stay with the original provider. `models.json` remains above that base.
-- **Existing static legacy `streamSimple` registrations:** the original callback and configuration are retained. This includes `pi-fast-mode`'s Codex registration. Legacy dynamic catalogs and OAuth model-projection callbacks are excluded.
-- **Plain built-in providers and other unsupported registrations:** portable Pi compaction only. Injecting a legacy wrapper here would silently change full-stream calls into simple-stream calls.
+- **Existing static legacy `streamSimple` registrations:** the original callback and configuration are retained. This includes `pi-fast-mode`'s Codex registration.
+- **Built-in and composed providers:** the existing provider object's full and simple streaming methods are leased separately, without re-registering the provider or rebuilding auth/catalog configuration. Each original method retains its receiver. Cleanup restores only still-owned methods; replacing the provider revokes observation until it is reacquired.
 
 For an eligible request, protocol selection is automatic:
 
@@ -24,11 +24,36 @@ For an eligible request, protocol selection is automatic:
 
 An API name does not prove its backend supports that protocol. Failed attempts return the already-produced portable summary; no other provider or protocol is probed. In-stream `context_management` remains unsupported.
 
+## Cached portable summaries
+
+On a successful request with reported cache reads or writes, the extension can reuse the same model, prompt, tools, reasoning settings and cache routing for a summary. This works independently of native checkpoints, including DeepSeek and Xiaomi's OpenAI-compatible APIs and Anthropic Messages.
+
+The summary request extends the captured logical prompt, rather than serializing tool results into Pi's 2,000-character excerpts. A final payload check preserves the existing prefix and request policy. The instruction quotes the retained boundary, separates verified progress from plans, and asks for user constraints in their original wording. The latest assistant response can remain outside the request when it is in the retained suffix. Coverage that cannot be mapped safely uses ordinary Pi compaction.
+
+`settings.json` preferences:
+
+```json
+{
+  "providerCompaction": {
+    "cachedSummaries": true,
+    "outcomeNotifications": false
+  }
+}
+```
+
+These are the defaults on hosts exposing Pi\'s `getSettings` API; older hosts retain native compaction with cached summaries disabled. Optional `cacheRetention` accepts `"short"`, `"long"`, or `"none"`; omission inherits Pi/provider behavior. Retention is applied per request, not through process-wide environment changes. A longer tier can increase cache-write charges and only works where the adapter/backend supports it.
+
+A cache hit is best effort, not a promised saving. Countdown estimates use the model's declared `promptCache` lifetime for the active tier, measured conservatively from request dispatch. Missing lifetimes remain unknown: DeepSeek, for example, [documents best-effort eviction over hours to days](https://api-docs.deepseek.com/guides/kv_cache/), not a predictable expiry. Pi's successful warmer requests refresh the observed cycle and countdown.
+
+With [pi-compactor's opt-in idle expiry policy](https://github.com/nijaru/pi-compactor#cache-aware-idle-compaction), compaction can run before an estimated expiry. The companion rechecks the cycle, session, model, history and auth; a failed cached-only attempt cancels instead of starting an ordinary summary. It does not start a continuation.
+
+Cached generation and native acquisition share one portable result. If cached output is empty, truncated or requests tools, ordinary/manual compaction can use one standard fallback; any reported failed-attempt usage is included in the resulting checkpoint. Tools requested by a summarizer are never executed. Native replay requests contain opaque state, so their readable transcript alone does not qualify as a cached portable-summary snapshot.
+
 ## Coverage and replay
 
 Native state covers **only the prefix summarized by Pi**, ending before `firstKeptEntryId`. It does not cover retained recent messages.
 
-The extension captures a bounded, fully prepared request after Pi's payload hooks finish. An exact serializer validator proves the covered prefix and a closed tool-exchange boundary. Native input comes from that captured request—not reconstructed persisted history. A recent capture may omit the latest assistant response if that response is retained rather than summarized. Captures expire after five minutes and are limited to 8 MiB of context plus payload.
+The extension captures a bounded logical request after Pi's payload hooks finish. Adapters can still optimize transport afterward—for example, Codex cached WebSockets can send a server-state delta—so this is not a claim of final HTTP/WebSocket byte identity. An exact serializer validator proves the covered prefix and a closed tool-exchange boundary. Native input comes from that captured request—not reconstructed persisted history. A recent capture may omit the latest assistant response if that response is retained rather than summarized. Native coverage snapshots expire after five minutes. Both snapshot types are limited to 8 MiB of context plus payload; cached-summary eligibility follows the observed cache lifetime when one is declared.
 
 Replay replaces exactly one validated portable-summary contribution with the native output window. Retained and new messages, instructions, tools and other request fields remain from the actual request. No live suffix is rebuilt.
 
@@ -48,7 +73,7 @@ Legacy v1/v2 whole-history checkpoints remain inspectable but are never reinterp
 
 ## Diagnose portable fallback
 
-Run `/provider-compaction-status` to see whether the observer is installed, the latest capture status, and the last compaction attempt in this runtime. Portable fallback also appends a `pi-provider-compaction:diagnostic` session entry containing only a fixed reason string. It is not included in model context. Diagnostics never include request content, credentials, or backend error text.
+Run `/provider-compaction-status` to see observer/capture eligibility, estimated cache lifetime, the last selected path, elapsed time, reported input/cache/output tokens, and catalog-priced cost. Optional outcome notifications show measured usage after a committed compaction; hypothetical savings are not presented as measured. Failed/cancelled expiry attempts remain visible in runtime status; if no checkpoint is saved, their usage cannot be attached to compaction totals through Pi's extension API. Portable fallback also appends a `pi-provider-compaction:diagnostic` session entry containing only a fixed reason string. It is not included in model context. Diagnostics never include request content, credentials, or backend error text.
 
 These diagnostics require the extension to be loaded when the attempt happens; they cannot explain earlier compactions retroactively. A committed native checkpoint does not by itself prove that a later request replayed it.
 
@@ -73,9 +98,9 @@ pi --extension ./dist/index.js
 
 The manifest loads the built `dist/index.js`, including a bundled stateless Responses serializer validator; source or host dependency changes require a rebuild. `bun run check` rebuilds first and tests the artifact against Pi's actual host serializer, including function-call history replayed as grammar tools. Keep global installation disabled while testing. Publishing and global activation are separate approval steps.
 
-Tests include real Pi 1.4.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence in both extension orders. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration.
+Tests include real Pi 1.4.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence and real idle-expiry transactions in both extension orders. Cached-summary fixtures also exercise built-in DeepSeek/Xiaomi dispatch, Anthropic Messages, late tool output, truncated-output fallback and measured usage. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration.
 
-Authenticated protocol smoke tests are separate and send three small requests:
+Authenticated cached-summary smoke tests use synthetic history, including a value beyond the ordinary tool-result excerpt, and check continuation:\n\n```bash\nbun run tests/cached-live-smoke.ts deepseek deepseek-flash\n```\n\nThey send four requests, plus a native-checkpoint request when eligible, and can incur API charges. A successful smoke is not a summary-quality guarantee.\n\nAuthenticated native-protocol smoke tests are separate and send three small requests:
 
 ```bash
 bun run tests/live-smoke.ts openai-codex gpt-5.5

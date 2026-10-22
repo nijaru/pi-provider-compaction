@@ -33,6 +33,7 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 			ui: { notify: (value: string) => { status = value; } },
 		};
 		const pi: any = {
+			getSettings: () => ({}),
 			on: (name: string, handler: Function) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
 			registerCommand: (name: string, command: any) => commands.set(name, command),
 			registerProvider: (provider: any) => { registration = provider; },

@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { normalizeContext, type Provider } from "@earendil-works/pi-ai";
-import { decorateProvider, installObserver, STREAM_OBSERVER } from "../provider";
+import { decorateProvider, installObserver, leaseEffectiveProvider, STREAM_OBSERVER } from "../provider";
 import { NativeCompactionValidationError, requestProviderCompaction } from "../protocol";
 
 const model = { provider: "fixture", api: "openai-responses", id: "fixture" } as any;
@@ -70,7 +70,7 @@ function registryFixture(original?: any, native?: Provider) {
 		},
 		unregisterProvider() { config = undefined; registered = undefined; },
 	};
-	const registry: any = { getRegisteredProviderConfig: () => config, getRegisteredNativeProvider: () => registered,
+	const registry: any = { getProvider: () => registered, getRegisteredProviderConfig: () => config, getRegisteredNativeProvider: () => registered,
 		registerProvider: pi.registerProvider, unregisterProvider: pi.unregisterProvider };
 	const ctx: any = { model, modelRegistry: registry };
 	return { pi, ctx, registry };
@@ -158,4 +158,51 @@ test("an unusable native window reports the billed usage for the fallback", asyn
 	}).catch((caught) => caught);
 	expect(error).toBeInstanceOf(NativeCompactionValidationError);
 	expect(error.usage.cost.total).toBe(0.3);
+});
+
+test("effective-provider leases preserve dispatch and cleanup without registry replacement", async () => {
+	const complete = { role: "assistant" } as any;
+	const stream = { result: async () => complete } as any;
+	const calls: string[] = [], completions: unknown[] = [];
+	let options: any;
+	const base = { id: "builtin", auth: {}, getModels() { expect(this).toBe(base); return [model]; },
+		stream(_model: any, _context: any, next: any) { expect(this).toBe(base); calls.push("full"); options = next; return stream; },
+		streamSimple(_model: any, _context: any, next: any) { expect(this).toBe(base); calls.push("simple"); options = next; return stream; },
+	} as unknown as Provider;
+	const descriptors = Object.getOwnPropertyDescriptors(base);
+	let current: Provider | undefined = base;
+	const lease = leaseEffectiveProvider(base, () => current, () => Object.assign((payload: any) => ({ ...payload, observed: true }), { complete: (message: unknown) => { completions.push(message); }, cacheRetention: "long" as const }))!;
+	expect(base.getModels()).toEqual([model]);
+	const auth = base.auth;
+	base.stream(model, context, { onPayload: async (payload: any) => ({ ...payload, lateHook: true }) });
+	expect(await options.onPayload({}, model)).toEqual({ lateHook: true, observed: true });
+	expect(options.cacheRetention).toBe("long");
+	base.streamSimple(model, context, {});
+	await Promise.resolve();
+	expect(completions).toEqual([complete, complete]);
+	expect(calls).toEqual(["full", "simple"]);
+	expect(base.auth).toBe(auth);
+	current = undefined; // Recomposition detached this provider; still restore owned methods.
+	lease.remove();
+	expect(Object.getOwnPropertyDescriptors(base)).toEqual(descriptors);
+	expect(lease.isInstalled()).toBe(false);
+});
+
+test("overlapping leases never resurrect released observation or overwrite another owner's method", async () => {
+	let captures = 0, options: any;
+	const base = { id: "builtin", name: "Builtin", auth: {}, getModels: () => [model], stream() { return { result: async () => ({}) } as any; }, streamSimple(_model: any, _context: any, next: any) { options = next; return { result: async () => ({}) } as any; } } as Provider;
+	const observer = () => (payload: unknown) => { captures++; return payload; };
+	const first = leaseEffectiveProvider(base, () => base, observer)!;
+	const second = leaseEffectiveProvider(base, () => base, observer)!;
+	first.remove();
+	second.remove(); // Restores first's method values, whose released lease must stay inert.
+	base.streamSimple(model, context, {});
+	expect(options.onPayload).toBeUndefined();
+	expect(captures).toBe(0);
+	expect(first.isInstalled()).toBe(false);
+	const third = leaseEffectiveProvider(base, () => base, observer)!;
+	const unrelated = (() => ({})) as any;
+	base.stream = unrelated;
+	third.remove();
+	expect(base.stream).toBe(unrelated);
 });
