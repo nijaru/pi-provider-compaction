@@ -2,7 +2,7 @@
 
 Experimental cache-aware compaction for [Pi](https://github.com/earendil-works/pi), with portable summaries and optional provider-native checkpoints. Minimum runtime: Pi 0.87.0. Development checks target Pi 1.4.0.
 
-**This experimental design is not production-validated. Do not enable it globally yet.** Real runner/adapter fixtures and a Codex live smoke test pass; broader backend and deployment validation remains incomplete.
+**Experimental; qualified backend probes are not production validation.** Real runner/adapter fixtures and live DeepSeek, MiMo and Codex probes pass, with the preservation and cache-hit qualifications below. Broader backend and deployment validation remains incomplete.
 
 [pi-compactor](https://github.com/nijaru/pi-compactor) owns compaction timing and continuation. This extension owns cached summary generation, native request capture, prefix coverage, persistence and replay. It does not change `/fast` or account reporting.
 
@@ -113,14 +113,15 @@ They send four requests, plus a native-checkpoint request when eligible, and can
 Authenticated native-protocol smoke tests are separate and send three small requests:
 
 ```bash
-bun run tests/live-smoke.ts openai-codex gpt-5.5
+bun run tests/live-smoke.ts openai-codex gpt-6.1-sol
 ```
 
-Validation on 2026-09-22:
+Backend qualification with Pi 1.4.0 on 2026-10-22:
 
-- **Codex `gpt-5.5`:** prefix-only Remote V2 compaction and continuation accepted; an exact code held only in the summarized assistant message was recalled.
-- **Direct OpenAI `gpt-5.5`:** initial request failed; compact/continuation remain unverified.
-- **Azure:** no configured credentials; fixtures only.
+- **Codex `gpt-6.1-sol`:** prefix-only Remote V2 checkpoint/replay and the combined portable-summary/native-checkpoint flow passed exact-code continuation checks. The combined run reported no cache reads; selecting the cached path does not guarantee a cache hit.
+- **DeepSeek Flash:** cached portable compaction retained a calibration value beyond the ordinary tool-result excerpt and the user's deployment constraint; continuation recalled both.
+- **MiMo v2.6 Flash:** three bounded probes passed, with the exact calibration value present in each continuation request. Earlier probes also produced an intermittent malformed/wrong-answer continuation; successful reruns do not resolve that preservation uncertainty.
+- **Direct OpenAI and Azure:** current authenticated backend qualification remains incomplete; real-adapter fixtures pass.
 
 The installed `pi-fast-mode` 0.0.2 composition/reload fixture passed separately. These checks do not establish transparent arbitrary-hook support or production readiness.
 
