@@ -1,5 +1,10 @@
 import { expect, test } from "bun:test";
-import { normalizeContext, type Provider } from "@earendil-works/pi-ai";
+import { spawnSync } from "node:child_process";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createAssistantMessageEventStream, InMemoryCredentialStore, normalizeContext, type Provider } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
 import { decorateProvider, installObserver, leaseEffectiveProvider, STREAM_OBSERVER } from "../provider";
 import { NativeCompactionValidationError, requestProviderCompaction } from "../protocol";
 
@@ -188,21 +193,192 @@ test("effective-provider leases preserve dispatch and cleanup without registry r
 	expect(lease.isInstalled()).toBe(false);
 });
 
-test("overlapping leases never resurrect released observation or overwrite another owner's method", async () => {
-	let captures = 0, options: any;
-	const base = { id: "builtin", name: "Builtin", auth: {}, getModels: () => [model], stream() { return { result: async () => ({}) } as any; }, streamSimple(_model: any, _context: any, next: any) { options = next; return { result: async () => ({}) } as any; } } as Provider;
-	const observer = () => (payload: unknown) => { captures++; return payload; };
-	const first = leaseEffectiveProvider(base, () => base, observer)!;
-	const second = leaseEffectiveProvider(base, () => base, observer)!;
+test("alternating shared-runtime leases stay bounded under Node", async () => {
+	const built = await Bun.build({ entrypoints: [join(import.meta.dir, "provider-leases.node.ts")], target: "node" });
+	expect(built.success).toBe(true);
+	const other = await Bun.build({ entrypoints: [join(import.meta.dir, "../provider.ts")], target: "node" });
+	expect(other.success).toBe(true);
+	const result = spawnSync("node", ["--input-type=module", "-", Buffer.from(await other.outputs[0]!.text()).toString("base64")], { input: await built.outputs[0]!.text(), encoding: "utf8", timeout: 20_000 });
+	expect(result.error).toBeUndefined();
+	expect(result.stderr).toBe("");
+	expect(result.status).toBe(0);
+});
+
+for (const releaseFirst of [0, 1]) test(`effective shared leases select sessions and release independently (first=${releaseFirst})`, async () => {
+	let forwarded: any;
+	const sentinel = {} as any; // No result(): completion observation is optional.
+	const base = { id: "fixture", stream(_m: any, _c: any, options: any) { forwarded = options; return sentinel; }, streamSimple(_m: any, _c: any, options: any) { forwarded = options; return sentinel; } } as Provider;
+	const descriptors = Object.getOwnPropertyDescriptors(base);
+	const seen: string[] = [];
+	const acquire = (session: string) => leaseEffectiveProvider(base, () => base, (_m, _c, options) => options.sessionId === session ? Object.assign((payload: any) => {
+		seen.push(session);
+		return { ...payload, session };
+	}, { cacheRetention: session === "A" ? "long" as const : "short" as const }) : undefined)!;
+	const failures = [
+		leaseEffectiveProvider(base, () => base, () => { throw new Error("expired session"); })!,
+		leaseEffectiveProvider(base, () => base, () => () => { throw new Error("optional payload failure"); })!,
+	];
+	const leases = [acquire("A"), acquire("B")];
+	const dispatch = async (sessionId: string) => {
+		expect(base.streamSimple(model, context, { sessionId, onPayload: async () => { await Promise.resolve(); return { caller: true }; } })).toBe(sentinel);
+		return forwarded.onPayload ? forwarded.onPayload({}, model) : undefined;
+	};
+	expect(leases.map((lease) => lease.isInstalled())).toEqual([true, true]);
+	expect(await dispatch("A")).toEqual({ caller: true, session: "A" });
+	expect(forwarded.cacheRetention).toBe("long");
+	expect(await dispatch("B")).toEqual({ caller: true, session: "B" });
+	expect(forwarded.cacheRetention).toBe("short");
+	const removed = releaseFirst === 0 ? "A" : "B", kept = releaseFirst === 0 ? "B" : "A";
+	leases[releaseFirst]!.remove();
+	expect(leases[1 - releaseFirst]!.isInstalled()).toBe(true);
+	expect(await dispatch(removed)).toEqual({ caller: true });
+	expect(await dispatch(kept)).toEqual({ caller: true, session: kept });
+	leases[releaseFirst] = acquire(removed);
+	expect(await dispatch(removed)).toEqual({ caller: true, session: removed });
+	leases.forEach((lease) => lease.remove());
+	failures.forEach((lease) => lease.remove());
+	expect(seen).toEqual(["A", "B", kept, removed]);
+	expect(Object.getOwnPropertyDescriptors(base)).toEqual(descriptors);
+});
+
+test("release and reacquire cannot revive an in-flight payload or completion observer", async () => {
+	let forwarded: any, finish: (message: any) => void;
+	const stream = { result: () => new Promise<any>((resolve) => { finish = resolve; }) } as any;
+	const base = { id: "fixture", streamSimple(_m: any, _c: any, options: any) { forwarded = options; return stream; }, stream() { return stream; } } as unknown as Provider;
+	const seen: string[] = [];
+	const acquire = (session: string) => leaseEffectiveProvider(base, () => base, (_m, _c, options) => options.sessionId === session ? Object.assign((payload: unknown) => { seen.push(session); return payload; }, { complete: () => { seen.push(`${session} complete`); } }) : undefined)!;
+	const first = acquire("A"), second = acquire("B");
+	let finishHook!: (payload: unknown) => void;
+	base.streamSimple(model, context, { sessionId: "A", onPayload: () => new Promise((resolve) => { finishHook = resolve; }) });
+	const payload = forwarded.onPayload({}, model);
 	first.remove();
-	second.remove(); // Restores first's method values, whose released lease must stay inert.
-	base.streamSimple(model, context, {});
-	expect(options.onPayload).toBeUndefined();
-	expect(captures).toBe(0);
+	const replacement = acquire("A");
+	finishHook({ caller: true });
+	expect(await payload).toEqual({ caller: true });
+	finish!({});
+	await Promise.resolve();
+	expect(seen).toEqual([]);
+	expect(replacement.isInstalled()).toBe(true);
+	expect(second.isInstalled()).toBe(true);
+	second.remove(); replacement.remove();
+});
+
+test("effective reacquisition preserves external replacements and restores detached descriptors", () => {
+	const original = (() => ({})) as any;
+	const prototype = { streamSimple: original };
+	const base = Object.assign(Object.create(prototype), { id: "fixture" }) as Provider;
+	Object.defineProperty(base, "stream", { value: original, configurable: false, writable: true, enumerable: false });
+	const descriptors = Object.getOwnPropertyDescriptors(base);
+	let current: Provider | undefined = base;
+	const acquire = () => leaseEffectiveProvider(base, () => current, () => undefined)!;
+	const first = acquire(), second = acquire();
+	const saved = { stream: base.stream, streamSimple: base.streamSimple };
+	const replacement = (() => ({})) as any;
+	base.stream = replacement;
 	expect(first.isInstalled()).toBe(false);
-	const third = leaseEffectiveProvider(base, () => base, observer)!;
-	const unrelated = (() => ({})) as any;
-	base.stream = unrelated;
+	const third = acquire(); // Prune the still-owned simple method before reacquiring.
+	first.remove(); second.remove();
+	expect(third.isInstalled()).toBe(true);
+	current = undefined;
 	third.remove();
-	expect(base.stream).toBe(unrelated);
+	expect(Object.getOwnPropertyDescriptors(base)).toEqual({ ...descriptors, stream: { ...descriptors.stream, value: replacement } });
+	expect(Object.hasOwn(base, "streamSimple")).toBe(false);
+	// Even an explicitly reinstated, released pair cannot revive its leases or
+	// become a new dispatch history on the next acquisition.
+	Object.assign(base, saved);
+	current = base;
+	const fourth = acquire();
+	expect(first.isInstalled()).toBe(false);
+	expect(fourth.isInstalled()).toBe(true);
+	fourth.remove();
+	expect(Object.getOwnPropertyDescriptors(base)).toEqual(descriptors);
+});
+
+for (const kind of ["native", "legacy"] as const) for (const releaseFirst of [0, 1]) test(`real Pi ${kind} registration shares one dispatcher (release first=${releaseFirst})`, async () => {
+	const directory = await mkdtemp(join(tmpdir(), "provider-leases-"));
+	try {
+		const modelsPath = join(directory, "models.json");
+		await writeFile(modelsPath, JSON.stringify({ providers: { fixture: { headers: { "x-fixture": "kept" } } } }));
+		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath, modelsStorePath: join(directory, "catalog.json"), refreshOnCreate: false });
+		const registries = [new ModelRegistry(runtime), new ModelRegistry(runtime)];
+		const built = await Bun.build({ entrypoints: [join(import.meta.dir, "../provider.ts")], target: "bun" });
+		expect(built.success).toBe(true);
+		const other: typeof import("../provider") = await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`);
+		const captures: string[] = [], completions: string[] = [], calls: string[] = [];
+		const payloads: any[] = [];
+		const fixtureModel = { ...model, name: "Fixture", baseUrl: "https://fixture.invalid", input: ["text"], reasoning: false, contextWindow: 10000, maxTokens: 1000, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+		const dispatch = (method: string, options: any) => {
+			calls.push(method);
+			const stream = createAssistantMessageEventStream();
+			void (async () => {
+				payloads.push(await options.onPayload({}, fixtureModel));
+				const message = { role: "assistant", content: [], api: model.api, provider: model.provider, model: model.id, stopReason: "stop", usage: nativeUsage, timestamp: 0 } as any;
+				stream.push({ type: "done", reason: "stop", message });
+				stream.end();
+			})();
+			return stream;
+		};
+		const base = { id: model.provider, name: "Fixture", auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => ({ auth: { apiKey: "fixture" }, source: "fixture" }) } }, getModels: () => [fixtureModel],
+			stream(_m: any, _c: any, options: any) { expect(this).toBe(base); return dispatch("full", options); },
+			streamSimple(_m: any, _c: any, options: any) { if (kind === "native") expect(this).toBe(base); return dispatch("simple", options); },
+		} as Provider;
+		if (kind === "native") runtime.registerNativeProvider(base);
+		else runtime.registerProvider(model.provider, { api: model.api, apiKey: "fixture", models: [fixtureModel], streamSimple: base.streamSimple });
+		const originalConfig = runtime.getRegisteredProviderConfig(model.provider);
+		const acquire = (index: number) => {
+			const registry = registries[index]!;
+			return (index === 0 ? installObserver : other.installObserver)({ registerProvider: registry.registerProvider.bind(registry) } as any, { model: fixtureModel, modelRegistry: registry } as any, (_m, _c, options) => {
+				if (options.sessionId !== String(index)) return;
+				return Object.assign((payload: any) => { captures.push(String(index)); return { ...payload, session: index }; }, { complete: () => { completions.push(String(index)); } });
+			})!;
+		};
+		const leases = [acquire(0), acquire(1)];
+		expect(leases.map((lease) => lease.isInstalled())).toEqual([true, true]);
+		const send = async (index: number, method: "stream" | "streamSimple" = "streamSimple") => {
+			const stream = runtime.getProvider(model.provider)![method](fixtureModel, context, { sessionId: String(index), onPayload: async () => { await Promise.resolve(); return { caller: true }; } });
+			const events = [];
+			for await (const event of stream) events.push(event);
+			expect(events.map((event) => event.type)).toEqual(["done"]);
+			expect((await stream.result()).stopReason).toBe("stop");
+			return payloads.at(-1);
+		};
+		expect(await send(0, "stream")).toEqual({ caller: true, session: 0 });
+		expect(await send(1)).toEqual({ caller: true, session: 1 });
+		expect(calls).toEqual([kind === "native" ? "full" : "simple", "simple"]);
+		expect(completions).toEqual(["0", "1"]);
+		leases[releaseFirst]!.remove();
+		expect(await send(releaseFirst)).toEqual({ caller: true });
+		expect(await send(1 - releaseFirst)).toEqual({ caller: true, session: 1 - releaseFirst });
+		// Recomposition changes the effective object, not the shared registered owner.
+		const effective = runtime.getProvider(model.provider);
+		if (kind === "native") registries[0]!.registerProvider(runtime.getRegisteredNativeProvider(model.provider)!);
+		else registries[0]!.registerProvider(model.provider, { name: "Independent update" });
+		expect(runtime.getProvider(model.provider)).not.toBe(effective);
+		expect(leases[1 - releaseFirst]!.isInstalled()).toBe(true);
+		leases[releaseFirst] = acquire(releaseFirst);
+		expect(await send(releaseFirst)).toEqual({ caller: true, session: releaseFirst });
+		expect(captures).toEqual(["0", "1", String(1 - releaseFirst), String(releaseFirst)]);
+		expect(completions).toEqual(captures);
+		if (kind === "legacy") {
+			const marker = Reflect.get(runtime.getRegisteredProviderConfig(model.provider)!.streamSimple!, STREAM_OBSERVER);
+			expect(marker.delegate).toBe(base.streamSimple);
+			marker.release(); // /fast must be able to retire every lease over its delegate.
+			expect(leases.map((lease) => lease.isInstalled())).toEqual([false, false]);
+		}
+		leases.forEach((lease) => lease.remove());
+		if (kind === "native") expect(runtime.getRegisteredNativeProvider(model.provider)).toBe(base);
+		else expect(runtime.getRegisteredProviderConfig(model.provider)).toEqual({ ...originalConfig, name: "Independent update" });
+		const last = acquire(0);
+		if (kind === "native") {
+			const replacement = { ...base, name: "Unrelated owner" };
+			registries[1]!.registerProvider(replacement);
+			last.remove();
+			expect(runtime.getRegisteredNativeProvider(model.provider)).toBe(replacement);
+		} else {
+			const replacement = (() => ({})) as any;
+			registries[1]!.registerProvider(model.provider, { api: model.api, streamSimple: replacement });
+			last.remove();
+			expect(runtime.getRegisteredProviderConfig(model.provider)!.streamSimple).toBe(replacement);
+		}
+	} finally { await rm(directory, { recursive: true, force: true }); }
 });

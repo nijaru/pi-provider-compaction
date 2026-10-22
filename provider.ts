@@ -37,12 +37,76 @@ function observedStream<T extends StreamOptions>(model: Model<any>, context: Tra
 	return stream;
 }
 
-function guardedObserver(handler: PayloadObserver, current: () => boolean): PayloadObserver {
-	return Object.assign((payload: unknown) => current() ? handler(payload) : payload, {
-		cacheRetention: handler.cacheRetention,
-		complete: handler.complete ? (message: AssistantMessage) => { if (current()) handler.complete!(message); } : undefined,
-	});
+/** One dispatch layer, with session-local selection and no released lease history. */
+function observerLeases(provider: string, owned: () => boolean, restore: () => void) {
+	const leases = new Map<symbol, { observe: ObserveRequest; current: () => boolean }>();
+	let closed = false;
+	const active = (token: symbol) => !closed && leases.get(token)?.current() === true && owned();
+	const release = () => {
+		if (closed) return;
+		closed = true;
+		leases.clear();
+		restore();
+	};
+	const observe: ObserveRequest = (...args) => {
+		const handlers: PayloadObserver[] = [];
+		for (const [token, lease] of leases) {
+			try {
+				if (!active(token)) continue;
+				const handler = lease.observe(...args);
+				if (!handler) continue;
+				handlers.push(Object.assign((payload: unknown) => active(token) ? handler(payload) : payload, {
+					cacheRetention: handler.cacheRetention,
+					complete: handler.complete ? (message: AssistantMessage) => { if (active(token)) handler.complete!(message); } : undefined,
+				}));
+			} catch { /* A failed optional observer must not disable the other sessions. */ }
+		}
+		if (!handlers.length) return;
+		return Object.assign(async (payload: unknown) => {
+			for (const handler of handlers) {
+				try {
+					const replacement = await handler(payload);
+					if (replacement !== undefined) payload = replacement;
+				} catch { /* Keep the last valid request on optional observation failure. */ }
+			}
+			return payload;
+		}, {
+			cacheRetention: [...handlers].reverse().find((handler) => handler.cacheRetention !== undefined)?.cacheRetention,
+			complete: handlers.some((handler) => handler.complete) ? (message: AssistantMessage) => {
+				for (const handler of handlers) {
+					try { handler.complete?.(message); } catch { /* Isolate optional completion observers too. */ }
+				}
+			} : undefined,
+		});
+	};
+	return {
+		observe, release, isOpen: () => !closed,
+		add(observe: ObserveRequest, current: () => boolean = () => true): InstalledObserver {
+			const token = Symbol();
+			leases.set(token, { observe, current });
+			return { provider, isInstalled: () => active(token), remove() {
+				leases.delete(token);
+				if (!leases.size) release();
+			} };
+		},
+	};
 }
+
+type ObserverLeases = ReturnType<typeof observerLeases>;
+// Pi's uncached module loader can instantiate this extension separately for
+// sessions sharing one model runtime. Weak ownership must span those instances.
+const LEASE_TABLES = Symbol.for("@nijaru/pi-provider-compaction/observer-leases-v1");
+interface LeaseTables {
+	effectiveLeases: WeakMap<Provider, { owned(): boolean; leases: ObserverLeases }>;
+	effectiveRestores: WeakMap<Function, { base: Provider; restore(): void }>;
+	nativeLeases: WeakMap<Provider, ObserverLeases>;
+	legacyLeases: WeakMap<Provider["streamSimple"], ObserverLeases>;
+}
+const shared = globalThis as typeof globalThis & { [LEASE_TABLES]?: LeaseTables };
+const { effectiveLeases, effectiveRestores, nativeLeases, legacyLeases } = shared[LEASE_TABLES] ??= {
+	effectiveLeases: new WeakMap(), effectiveRestores: new WeakMap(),
+	nativeLeases: new WeakMap(), legacyLeases: new WeakMap(),
+};
 
 /** Preserve method receivers, getters, optional members and dynamic catalogs. */
 export function decorateProvider(base: Provider, observe: ObserveRequest): Provider {
@@ -64,31 +128,38 @@ export function decorateProvider(base: Provider, observe: ObserveRequest): Provi
 /** Observe a builtin/composer in place, preserving its auth, catalogs and dispatch closure. */
 export function leaseEffectiveProvider(base: Provider | undefined, current: () => Provider | undefined, observe: ObserveRequest): InstalledObserver | undefined {
 	if (!base) return;
+	const existing = effectiveLeases.get(base);
+	if (existing?.leases.isOpen() && existing.owned()) return existing.leases.add(observe, () => current() === base);
+	// External replacement invalidated the old pair. Restore its still-owned
+	// method before capturing delegates, rather than burying a released wrapper.
+	existing?.leases.release();
+	// A third party may have restored saved method values after their release.
+	// They remain inert, but must not become delegates of another observation layer.
 	const keys = ["stream", "streamSimple"] as const;
+	for (const key of keys) {
+		const saved = effectiveRestores.get(base[key]);
+		if (saved?.base === base) saved.restore();
+	}
 	const descriptors = keys.map((key) => Object.getOwnPropertyDescriptor(base, key));
 	if (descriptors.some((descriptor) => descriptor && (!("value" in descriptor) || !descriptor.configurable && !descriptor.writable)) || !Object.isExtensible(base) && descriptors.some((descriptor) => !descriptor)) return;
 	const originalStream = base.stream, originalSimple = base.streamSimple;
-	let released = false;
-	const isInstalled = () => !released && current() === base && base.stream === stream && base.streamSimple === streamSimple;
-	const guarded: ObserveRequest = (...args) => {
-		if (!isInstalled()) return;
-		const handler = observe(...args);
-		return handler ? guardedObserver(handler, isInstalled) : undefined;
-	};
-	const stream: Provider["stream"] = (model, context, options) => observedStream(model, context, options, guarded, (next) => originalStream.call(base, model, context, next));
-	const streamSimple: Provider["streamSimple"] = (model, context, options) => observedStream(model, context, options, guarded, (next) => originalSimple.call(base, model, context, next));
-	const remove = () => {
-		released = true;
+	const owned = () => base.stream === stream && base.streamSimple === streamSimple;
+	const restore = () => {
 		for (const [index, key] of keys.entries()) if (base[key] === (key === "stream" ? stream : streamSimple)) {
 			const descriptor = descriptors[index];
 			if (descriptor) Object.defineProperty(base, key, descriptor);
 			else Reflect.deleteProperty(base, key);
 		}
 	};
+	const leases = observerLeases(base.id, owned, restore);
+	const stream: Provider["stream"] = (model, context, options) => observedStream(model, context, options, leases.observe, (next) => originalStream.call(base, model, context, next));
+	const streamSimple: Provider["streamSimple"] = (model, context, options) => observedStream(model, context, options, leases.observe, (next) => originalSimple.call(base, model, context, next));
 	try {
 		for (const [index, key] of keys.entries()) Object.defineProperty(base, key, { ...descriptors[index], value: key === "stream" ? stream : streamSimple, ...(descriptors[index] ? {} : { configurable: true, writable: true, enumerable: true }) });
-	} catch { remove(); return; }
-	return { provider: base.id, isInstalled, remove };
+	} catch { leases.release(); return; }
+	for (const method of [stream, streamSimple]) effectiveRestores.set(method, { base, restore });
+	effectiveLeases.set(base, { owned, leases });
+	return leases.add(observe, () => current() === base);
 }
 
 /**
@@ -109,23 +180,17 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 		// wrapper; claiming an observer there would report native compaction as
 		// installed while never capturing anything.
 		if (typeof native.getModels !== "function" || !native.getModels().some((entry) => entry.api === model.api)) return;
-		let released = false;
-		const isInstalled = () => !released && registry.getRegisteredNativeProvider(id) === wrapper;
-		const guarded: ObserveRequest = (...args) => {
-			if (!isInstalled()) return;
-			const handler = observe(...args);
-			return handler ? guardedObserver(handler, isInstalled) : undefined;
-		};
-		const wrapper = decorateProvider(native, guarded);
+		const existing = nativeLeases.get(native);
+		if (existing) return existing.add(observe);
+		const leases = observerLeases(id, () => registry.getRegisteredNativeProvider(id) === wrapper, () => {
+			// Keep cleanup usable after bare SDK disposal invalidates the extension API.
+			if (registry.getRegisteredNativeProvider(id) === wrapper) registry.registerProvider(native);
+			nativeLeases.delete(wrapper);
+		});
+		const wrapper = decorateProvider(native, leases.observe);
+		nativeLeases.set(wrapper, leases);
 		pi.registerProvider(wrapper);
-		return {
-			provider: id, isInstalled,
-			remove() {
-				// Keep cleanup usable after bare SDK disposal invalidates the extension API.
-				if (isInstalled()) registry.registerProvider(native);
-				released = true;
-			},
-		};
+		return leases.add(observe);
 	}
 	const original = registry.getRegisteredProviderConfig(id);
 	// Refresh callbacks own mutable catalog state inside the composer. Replacing
@@ -137,25 +202,22 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 	}
 	// An injected legacy streamSimple overlay would also intercept full stream()
 	// calls and change reasoning semantics. Only decorate an existing stream owner.
+	const existing = legacyLeases.get(original.streamSimple);
+	if (existing) return existing.add(observe);
 	const delegate = original.streamSimple.bind(original);
-	let released = false;
-	const isInstalled = () => !released && registry.getRegisteredProviderConfig(id)?.streamSimple === wrapper && !registry.getRegisteredNativeProvider(id);
-	const guarded: ObserveRequest = (...args) => {
-		if (!isInstalled()) return;
-		const handler = observe(...args);
-		return handler ? guardedObserver(handler, isInstalled) : undefined;
-	};
-	const wrapper: Provider["streamSimple"] = (requestModel, context, options) => observedStream(requestModel, context, options, guarded, (next) => delegate(requestModel, context, next));
-	const remove = () => {
-		const owned = isInstalled();
-		released = true;
-		if (!owned) return;
+	const owned = () => registry.getRegisteredProviderConfig(id)?.streamSimple === wrapper && !registry.getRegisteredNativeProvider(id);
+	const leases = observerLeases(id, owned, () => {
+		legacyLeases.delete(wrapper);
+		if (!owned()) return;
 		// registerProvider merges undefined properties: remove our layer before restore.
 		const restored = { ...registry.getRegisteredProviderConfig(id)!, streamSimple: original.streamSimple };
 		registry.unregisterProvider(id);
 		registry.registerProvider(id, restored);
-	};
-	Object.defineProperty(wrapper, STREAM_OBSERVER, { value: { delegate: original.streamSimple, release: remove } });
+	});
+	const wrapper: Provider["streamSimple"] = (requestModel, context, options) => observedStream(requestModel, context, options, leases.observe, (next) => delegate(requestModel, context, next));
+	// /fast owns the delegate: its cleanup must release all observing sessions.
+	Object.defineProperty(wrapper, STREAM_OBSERVER, { value: { delegate: original.streamSimple, release: leases.release } });
+	legacyLeases.set(wrapper, leases);
 	pi.registerProvider(id, { ...original, streamSimple: wrapper });
-	return { provider: id, isInstalled, remove };
+	return leases.add(observe);
 }
