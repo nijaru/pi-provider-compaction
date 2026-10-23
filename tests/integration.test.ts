@@ -497,22 +497,26 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});
-	test("native failure returns the already-produced portable summary without another request", async () => {
-		const f = await fixture({ nativeFailure: true });
+	test.each(["rejected", "auth changed"])("native fallback preserves portable work and billed usage: %s", async mode => {
+		const f = await fixture({ nativeFailure: mode === "rejected" });
 		try {
 			await f.session.prompt("A ".repeat(1000));
 			await f.session.prompt("B ".repeat(100));
 			const before = f.requests.length;
+			if (mode === "auth changed") f.authControl.beforeNative = () => { f.authControl.key = "new-account"; };
 			const result = await f.session.compact();
 			expect(result.summary).toContain("Portable summary fixture");
 			expect(f.requests.length - before).toBe(2);
 			expect((result.details as any).type).toBeUndefined();
-			expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({ data: { status: "portable: native acquisition or validation failed" } });
+			expect(result.usage?.input).toBe(mode === "rejected" ? 20 : 40);
+			expect(result.usage?.output).toBe(mode === "rejected" ? 4 : 8);
+			const reason = mode === "rejected" ? "native acquisition or validation failed" : "auth changed after native generation";
+			expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({ data: { status: `portable: ${reason}` } });
 			const notices: string[] = [];
 			const command = f.session.extensionRunner.getCommand("provider-compaction-status")!;
 			const context = f.session.extensionRunner.createCommandContext();
 			await command.handler("", { ...context, ui: { ...context.ui, notify: (message) => { notices.push(message); } } });
-			expect(notices[0]).toContain("Last attempt: portable: native acquisition or validation failed");
+			expect(notices[0]).toContain(`Last attempt: portable: ${reason}`);
 			expect(notices[0]).not.toContain("fixture failure");
 			await f.session.prompt("C after portable fallback");
 			expect(JSON.stringify(f.requests.at(-1)!.body)).not.toContain("pi-provider-compaction:diagnostic");

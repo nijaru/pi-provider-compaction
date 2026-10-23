@@ -468,7 +468,13 @@ export default function (pi: ExtensionAPI): void {
 			if (!current()) return cancelled(combineUsage(native.usage, portable.usage));
 			const finalAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
 			if (!current()) return cancelled(combineUsage(native.usage, portable.usage));
-			if (!finalAuth.ok || routeDigest(finalAuth) !== capture.authHash) { fallback("auth changed after native generation"); return outcome(summaryPath, portable, "native auth changed"); }
+			if (!finalAuth.ok || routeDigest(finalAuth) !== capture.authHash) {
+				// The checkpoint is no longer safe to commit, but both requests
+				// completed and their known usage still belongs in the session.
+				portable.usage = combineUsage(native.usage, portable.usage);
+				fallback("auth changed after native generation");
+				return outcome(summaryPath, portable, "native auth changed");
+			}
 			const details: NativeCompactionDetails = {
 				...(isObject(portable.details) ? portable.details : {}),
 				type: NATIVE_COMPACTION_TYPE, version: 3, provider: capture.model.provider, api: capture.model.api, model: capture.model.id,
