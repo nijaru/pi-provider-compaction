@@ -174,21 +174,9 @@ export default function (pi: ExtensionAPI): void {
 	let unregisterCleanup: (() => void) | undefined;
 	let generation = 0;
 	let requestSequence = 0;
-	let captureStatus = "no request observed";
-	let compactionStatus = "not attempted in this runtime";
 	let fallbackReason: string | undefined;
-	const captureRejected = (reason: string) => { captureStatus = reason; };
-	const fallback = (reason: string) => { fallbackReason = reason; compactionStatus = `portable: ${reason}`; };
-	pi.registerCommand("provider-compaction-status", {
-		description: "Show cache/native eligibility and measured compaction usage",
-		handler: async (_args, context) => {
-			const state = cacheState(context);
-			const remaining = state.expiresAt === undefined ? "unknown lifetime" : `estimated ${Math.max(0, Math.ceil((state.expiresAt - Date.now()) / 1000))}s remaining (model declaration; best effort)`;
-			const usage = lastOutcome?.usage;
-			context.ui.notify(`Provider compaction\nObserver: ${observer?.isInstalled() ? "installed" : "unavailable for current registration"}\nCapture: ${captureStatus}\nCache: ${state.reason}; ${remaining}\nLast attempt: ${compactionStatus}${lastOutcome ? `\nOutcome: ${lastOutcome.path}, ${lastOutcome.elapsedMs}ms${usage ? `; input ${usage.input}, cache read ${usage.cacheRead}, write ${usage.cacheWrite}, output ${usage.output}; estimated cost $${usage.cost.total.toFixed(6)}` : "; usage unavailable"}${lastOutcome.reason ? `; ${lastOutcome.reason}` : ""}` : ""}`, "info");
-		},
-	});
-	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; cache = undefined; active = undefined; pending = undefined; expiryAttempt = undefined; captureStatus = "invalidated by lifecycle/history/policy change"; };
+	const fallback = (reason: string) => { fallbackReason = reason; };
+	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; cache = undefined; active = undefined; pending = undefined; expiryAttempt = undefined; };
 	const retire = () => {
 		usageObservers.clear();
 		invalidate();
@@ -260,17 +248,11 @@ export default function (pi: ExtensionAPI): void {
 		}
 		if (options.sessionId !== manager.getSessionId()) return;
 		if (compactionRequest) return;
-		if (!supportsNativeCompaction(model) && !supportsCachedSummary(model)) { captureRejected("unsupported API"); return; }
-		if (!options.onPayload) {
-			// The portable-summary request re-enters this observer without a payload
-			// callback. Do not overwrite the main request's capture diagnostic.
-			if (captureStatus !== "eligible prepared request captured") captureRejected("no payload callback");
-			return;
-		}
-		if (generic(owner)) { captureRejected("generic compaction model takes precedence"); return; }
+		if (!supportsNativeCompaction(model) && !supportsCachedSummary(model)) return;
+		if (!options.onPayload || generic(owner)) return;
 		// The Azure adapter also accepts API-specific overrides and process-env
 		// fallbacks. Those must not silently select a route absent from our evidence.
-		if (!supportedRouteOptions(model, options)) { captureRejected("unsupported route overrides"); return; }
+		if (!supportedRouteOptions(model, options)) return;
 		const ticket = generation;
 		const startedAt = Date.now();
 		const sequence = ++requestSequence;
@@ -296,11 +278,10 @@ export default function (pi: ExtensionAPI): void {
 			const normalizedHeaders = (headers: ProviderHeaders | undefined) => Object.entries(headers ?? {}).map(([name, value]) => [name.toLowerCase(), value]).sort(([a], [b]) => String(a).localeCompare(String(b)));
 			if (!auth.ok || generic(owner) || auth.apiKey !== options.apiKey || (auth.baseUrl ?? model.baseUrl) !== model.baseUrl || !equal(normalizedHeaders(auth.headers), normalizedHeaders(options.headers)) || !equal(auth.env ?? {}, options.env ?? {})) {
 				active = undefined; cache = undefined;
-				captureRejected("resolved auth/route differs from prepared request, or generic policy changed");
 				return payload;
 			}
 			const provider = owner.modelRegistry.getProvider(model.provider);
-			if (!provider) { captureRejected("provider unavailable"); return payload; }
+			if (!provider) return payload;
 			const routeHash = route(model, options);
 			if (config.cachedSummaries && supportsCachedSummary(model)) {
 				const warming = options.maxTokens === 1 && cache && cache.authHash === routeDigest(auth) && sameCachedPrompt(cache.payload, payload) && equal(cache.context, context);
@@ -310,8 +291,8 @@ export default function (pi: ExtensionAPI): void {
 				}, payload);
 				if (!warming) cache = undefined;
 			}
-			if (!supportsNativeCompaction(model)) { captureStatus = candidate ? "eligible cached request captured" : "cached request ineligible"; return payload; }
-			const prepared = capturePreparedRequest(model, context, canonical, payload, captureRejected);
+			if (!supportsNativeCompaction(model)) return payload;
+			const prepared = capturePreparedRequest(model, context, canonical, payload);
 			if (!prepared) { active = undefined; return payload; }
 			const policyHash = digest(requestPolicy(model, prepared));
 			const latest = latestCompaction(branch);
@@ -334,7 +315,6 @@ export default function (pi: ExtensionAPI): void {
 					} else active = undefined;
 				} else active = undefined;
 			} else active = undefined;
-			captureStatus = "eligible prepared request captured";
 			snapshot = {
 				prepared, model: structuredClone(model), provider,
 				options: { apiKey: options.apiKey, headers: structuredClone(options.headers), env: structuredClone(options.env), fetch: options.fetch, ...(typeof (options as { serviceTier?: unknown }).serviceTier === "string" ? { serviceTier: (options as { serviceTier: string }).serviceTier } : {}) },
@@ -359,7 +339,6 @@ export default function (pi: ExtensionAPI): void {
 		if (observer) { invalidate(); observer.remove(); observer = undefined; }
 		if (!supportsNativeCompaction(context.model) && !supportsCachedSummary(context.model)) return;
 		observer = installObserver(pi, context, observe);
-		captureStatus = observer ? "awaiting prepared request" : "unsupported provider registration";
 	};
 	pi.on("session_start", (_event, context) => {
 		retire();
@@ -386,15 +365,21 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_shutdown", () => { if (typeof removeInvalidation === "function") removeInvalidation(); });
 
 	pi.on("session_before_compact", async (event, context) => {
-		const began = Date.now();
-		compactionStatus = "preparing compaction";
+		const began = Date.now(), ticket = generation;
+		const sessionId = context.sessionManager.getSessionId();
 		fallbackReason = undefined;
 		const attempt = expiryAttempt;
 		const capture = snapshot;
 		const cached = cacheState(context).available ? cache : undefined;
 		snapshot = undefined; cache = undefined; pending = undefined;
 		const cancelled = (usage?: Usage, reason = "compaction ownership or input changed") => {
-			lastOutcome = { path: attempt ? "expiry cancelled" : "cancelled", elapsedMs: Date.now() - began, usage, reason };
+			// A cancelled attempt has no checkpoint to carry its known bill. Retain
+			// that usage in the existing session diagnostic, not a command-only cache.
+			if (usage && ticket === generation && ctx) {
+				try {
+					if (ctx.sessionManager.getSessionId() === sessionId) pi.appendEntry("pi-provider-compaction:diagnostic", { status: `${attempt ? "expiry cancelled" : "cancelled"}: ${reason}`, usage });
+				} catch { /* A disposed session cannot accept a diagnostic. */ }
+			}
 			return { cancel: true as const };
 		};
 		const reject = (reason: string) => {
@@ -408,7 +393,6 @@ export default function (pi: ExtensionAPI): void {
 			attempt.signal = event.signal;
 		}
 		if ((!capture && !cached) || !context.model || generic(context) || event.signal.aborted) return reject("no eligible snapshot, explicit model override, or aborted attempt");
-		const ticket = generation;
 		const branch = context.sessionManager.getBranch();
 		const branchHash = digest(branch);
 		const source = cached ?? capture!;
@@ -431,7 +415,6 @@ export default function (pi: ExtensionAPI): void {
 		let summaryPath = "standard";
 		let summaryReason: string | undefined;
 		if (cached) {
-			compactionStatus = "generating cached portable summary";
 			compactionRequest = true;
 			try {
 				const result = await cachedSummary(cached, context, event.preparation, event.customInstructions, event.signal, current);
@@ -446,7 +429,6 @@ export default function (pi: ExtensionAPI): void {
 			if (attempt) return cancelled(attemptedUsage, summaryReason ?? "warm cache unavailable");
 			// Without native coverage or a dispatched cached attempt, Pi can own fallback.
 			if (!input && !attemptedUsage) return reject(summaryReason ?? fallbackReason ?? "native coverage unavailable");
-			compactionStatus = "generating portable summary";
 			try {
 				portable = await compact(event.preparation, source.model, auth.apiKey, auth.headers as Record<string, string> | undefined, event.customInstructions, event.signal, context.thinkingLevel, source.provider.streamSimple.bind(source.provider), auth.env, undefined, undefined, source.sessionId);
 				portable = withFileTracking(portable, event.preparation);
@@ -463,14 +445,12 @@ export default function (pi: ExtensionAPI): void {
 			return { compaction: result! };
 		};
 		if (!capture || !protocol || !input) {
-			compactionStatus = `${summaryPath} portable summary prepared`;
 			return outcome(summaryPath, portable, summaryReason);
 		}
 		try {
 			const freshAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
 			if (!current()) return cancelled(portable.usage);
 			if (!freshAuth.ok || routeDigest(freshAuth) !== capture.authHash) { fallback("auth changed after portable generation"); return outcome(summaryPath, portable, "native auth changed"); }
-			compactionStatus = "requesting native checkpoint";
 			let native: Awaited<ReturnType<typeof requestProviderCompaction>>;
 			compactionRequest = true;
 			try {
@@ -512,13 +492,10 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_compact", (event, context) => {
 		const recorded = isObject(event.compactionEntry.details) ? event.compactionEntry.details.providerCompaction : undefined;
 		const owned = isObject(recorded) && equal(recorded, lastOutcome);
-		if (readNativeCompactionDetails(event.compactionEntry.details)?.version === 3) compactionStatus = "native checkpoint committed";
-		else if (fallbackReason) compactionStatus = `portable: ${fallbackReason}`;
-		else if (owned) compactionStatus = `${lastOutcome!.path} portable summary committed`;
-		else fallback("another handler supplied the committed result");
+		if (!owned && !fallbackReason && readNativeCompactionDetails(event.compactionEntry.details)?.version !== 3) fallback("another handler supplied the committed result");
 		if (owned) {
 			if (configuration().outcomeNotifications && lastOutcome) context.ui.notify(`Compacted via ${lastOutcome.path} in ${(lastOutcome.elapsedMs / 1000).toFixed(1)}s${lastOutcome.usage ? `; cache read ${lastOutcome.usage.cacheRead}, write ${lastOutcome.usage.cacheWrite}; estimated cost $${lastOutcome.usage.cost.total.toFixed(6)}` : ""}`, "info");
-		} else lastOutcome = { path: "Pi/other handler", elapsedMs: 0, usage: event.compactionEntry.usage, reason: compactionStatus };
+		}
 		// Only static diagnostics are persisted, never request/auth data or error text.
 		if (fallbackReason) pi.appendEntry("pi-provider-compaction:diagnostic", { status: `portable: ${fallbackReason}` });
 		active = undefined; snapshot = undefined; cache = undefined;
@@ -538,5 +515,5 @@ export default function (pi: ExtensionAPI): void {
 			...(typeof candidate.capture.prepared.payload.model === "string" ? { payloadModel: candidate.capture.prepared.payload.model } : {}),
 		};
 	});
-	pi.on("session_compact_failed", () => { pending = undefined; snapshot = undefined; cache = undefined; compactionStatus = "compaction failed or cancelled"; });
+	pi.on("session_compact_failed", () => { pending = undefined; snapshot = undefined; cache = undefined; });
 }

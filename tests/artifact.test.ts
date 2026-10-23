@@ -23,23 +23,25 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 		const handlers = new Map<string, Function[]>();
 		const commands = new Map<string, any>();
 		let registration: any = { id: model.provider, getModels: () => [model], ...(adapter as ProviderStreams) };
-		let status = "";
+		const diagnostics: Array<{ type: string; data: unknown }> = [];
 		const branch = context.messages.map((message, i) => ({ type: "message", id: String(i), parentId: i ? String(i - 1) : null, timestamp: "2026-10-04", message }));
 		const apiKey = api === "openai-responses" ? "sk-fixture" : `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`;
 		const ctx: any = {
 			model, cwd: process.cwd(), isProjectTrusted: () => false,
 			sessionManager: { getSessionId: () => "fixture", getBranch: () => branch, buildSessionProjection: () => ({ messages: context.messages }) },
 			modelRegistry: { getRegisteredNativeProvider: () => registration, getProvider: () => registration, getApiKeyAndHeaders: async () => ({ ok: true, apiKey }), registerProvider: (provider: any) => { registration = provider; } },
-			ui: { notify: (value: string) => { status = value; } },
+			ui: { notify() {} },
 		};
 		const pi: any = {
 			getSettings: () => ({}),
 			on: (name: string, handler: Function) => handlers.set(name, [...(handlers.get(name) ?? []), handler]),
 			registerCommand: (name: string, command: any) => commands.set(name, command),
+			appendEntry: (type: string, data: unknown) => diagnostics.push({ type, data }),
 			registerProvider: (provider: any) => { registration = provider; },
 			events: { on: () => () => {}, emit() {} },
 		};
 		extension(pi);
+		expect(commands.size).toBe(0);
 		try {
 			for (const handler of handlers.get("session_start") ?? []) await handler({ reason: "new" }, ctx);
 			let payload: any;
@@ -56,9 +58,14 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 			expect(payload.input.some((item: any) => item.type === "custom_tool_call_output")).toBe(true);
 			expect(JSON.stringify(payload.input)).not.toContain("private thought");
 			if (api === "openai-responses") expect(payload.input.at(-1)).toEqual({ type: "configuration_update", reasoning: { effort: "high" } });
-			await commands.get("provider-compaction-status").handler("", ctx);
-			expect(status).toContain("Observer: installed");
-			expect(status).toContain("Capture: eligible prepared request captured");
+			// A captured request reaches auth revalidation before compaction. If the
+			// bundled serializer rejected this host grammar, no snapshot would exist.
+			ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: "rotated-fixture" });
+			for (const handler of handlers.get("session_before_compact") ?? []) {
+				expect(await handler({ branchEntries: branch, signal: new AbortController().signal, preparation: {} }, ctx)).toBeUndefined();
+			}
+			for (const handler of handlers.get("session_compact") ?? []) await handler({ compactionEntry: {} }, ctx);
+			expect(diagnostics).toContainEqual({ type: "pi-provider-compaction:diagnostic", data: { status: "portable: auth changed since capture" } });
 		} finally {
 			for (const handler of handlers.get("session_shutdown") ?? []) await handler({}, ctx);
 		}

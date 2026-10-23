@@ -519,12 +519,7 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(result.usage?.output).toBe(mode === "rejected" ? 4 : 8);
 			const reason = mode === "auth changed" ? "auth changed after native generation" : "native acquisition or validation failed";
 			expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({ data: { status: `portable: ${reason}` } });
-			const notices: string[] = [];
-			const command = f.session.extensionRunner.getCommand("provider-compaction-status")!;
-			const context = f.session.extensionRunner.createCommandContext();
-			await command.handler("", { ...context, ui: { ...context.ui, notify: (message) => { notices.push(message); } } });
-			expect(notices[0]).toContain(`Last attempt: portable: ${reason}`);
-			expect(notices[0]).not.toContain("fixture failure");
+			expect(JSON.stringify(f.manager.getBranch())).not.toContain("fixture failure");
 			await f.session.prompt("C after portable fallback");
 			expect(JSON.stringify(f.requests.at(-1)!.body)).not.toContain("pi-provider-compaction:diagnostic");
 		} finally { await f.close(); }
@@ -707,6 +702,23 @@ describe("cached portable summaries", () => {
 			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});
+	test("retired cached attempts do not append diagnostics after invalidation", async () => {
+		let bus: ExtensionAPI["events"];
+		const f = await fixture({ cached: true,
+			hooks(pi) { bus = pi.events; },
+			beforeReply(body) { if (JSON.stringify(body).includes("Write a portable context checkpoint")) bus.emit("pi-provider-compaction:invalidate", undefined); },
+		});
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const before = f.requests.length;
+			await expect(f.session.compact()).rejects.toThrow();
+			expect(f.requests).toHaveLength(before + 1);
+			expect(f.manager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
+			expect(f.manager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toHaveLength(0);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
 	test("a successful one-token warmer refreshes cache evidence and keeps summary coverage", async () => {
 		let context: any, sent: any, bus: any;
 		const f = await fixture({ cached: true, cacheTtl: 300, builtin: "deepseek", api: "openai-completions", hooks(pi) {
@@ -834,11 +846,9 @@ for (const hooksFirst of [false, true]) test.skipIf(!process.env.PI_COMPACTOR_FI
 		]);
 		expect(outcome.aborted).toBe(true);
 		expect(f.requests).toHaveLength(before + 1);
-		const notices: string[] = [];
-		const context = f.session.extensionRunner.createCommandContext();
-		await f.session.extensionRunner.getCommand("provider-compaction-status")!.handler("", { ...context, ui: { ...context.ui, notify: (message) => { notices.push(message); } } });
-		expect(notices[0]).toContain("Outcome: expiry cancelled");
-		expect(notices[0]).toContain("cache read 15");
+		expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({
+			data: { status: "expiry cancelled: compaction ownership or input changed", usage: { cacheRead: 15 } },
+		});
 		expect(f.requests.slice(before).some((request) => request.url.endsWith("/compact"))).toBe(false);
 		expect(f.manager.getBranch().some((entry) => entry.type === "compaction")).toBe(false);
 		expect(f.session.getFollowUpMessages()).toHaveLength(1);

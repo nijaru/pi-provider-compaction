@@ -77,9 +77,9 @@ Legacy v1/v2 whole-history checkpoints remain inspectable but are never reinterp
 
 ## Diagnose portable fallback
 
-Run `/provider-compaction-status` to see observer/capture eligibility, estimated cache lifetime, the last selected path, elapsed time, reported input/cache/output tokens, and estimated cost (including available companion corrections). Optional outcome notifications show measured usage after a committed compaction; hypothetical savings are not presented as measured. Failed/cancelled expiry attempts remain visible in runtime status; if no checkpoint is saved, their usage cannot be attached to compaction totals through Pi's extension API. Portable fallback also appends a `pi-provider-compaction:diagnostic` session entry containing only a fixed reason string. It is not included in model context. Diagnostics never include request content, credentials, or backend error text.
+Committed compaction entries retain the selected path, elapsed time, reported usage, and estimated cost. Optional outcome notifications show those measurements, not hypothetical savings. Portable fallback appends a `pi-provider-compaction:diagnostic` session entry with a fixed reason. Cancelled attempts with reported usage retain that usage in the same diagnostic record; without a saved checkpoint, Pi's extension API cannot include it in compaction totals. Diagnostics stay out of model context and never include request content, credentials, or backend error text.
 
-These diagnostics require the extension to be loaded when the attempt happens; they cannot explain earlier compactions retroactively. A committed native checkpoint does not by itself prove that a later request replayed it.
+These records describe attempts made while the extension was loaded; they cannot explain earlier compactions retroactively. A committed native checkpoint does not by itself prove that a later request replayed it.
 
 ## Generic compaction-model override
 
