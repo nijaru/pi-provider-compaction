@@ -1,6 +1,6 @@
 {
   "name": "@nijaru/pi-provider-compaction",
-  "version": "0.0.8",
+  "version": "0.0.9",
   "type": "module",
   "description": "Provider-native context compaction adapters for Pi",
   "keywords": [

@@ -123,7 +123,7 @@ Backend qualification with Pi 1.4.0 on 2026-10-22:
 - **MiMo v2.6 Flash:** three bounded probes passed, with the exact calibration value present in each continuation request. Earlier probes also produced an intermittent malformed/wrong-answer continuation; successful reruns do not resolve that preservation uncertainty.
 - **Direct OpenAI and Azure:** current authenticated backend qualification remains incomplete; real-adapter fixtures pass.
 
-The installed `pi-fast-mode` 0.0.2 composition/reload fixture passed separately. These checks do not establish transparent arbitrary-hook support or production readiness.
+The `pi-fast-mode` 0.0.4 composition/reload fixture also passed against Pi 1.4.0. These checks do not establish transparent arbitrary-hook support or production readiness.
 
 ## Related extensions
 
