@@ -20,7 +20,6 @@ export const COMPACTION_MODEL_FLAG = "compaction-model";
 const PROJECT_POLICY = "compaction-policy.json";
 const AGENT_DIR_OVERRIDE = "PI_COMPACTOR_AGENT_DIR";
 const MAX_POLICY_BYTES = 64 * 1024;
-const MAX_MODEL_SELECTORS = 8;
 const MAX_SELECTOR_LENGTH = 512;
 
 type PolicyContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted"> & {
@@ -43,21 +42,15 @@ function normalizeSelector(value: unknown): string | undefined {
 	return selector;
 }
 
-function parsePolicySelectors(value: unknown): string[] | undefined {
+function policyHasSelectors(value: unknown): boolean | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
 	if (!("models" in value) || !Array.isArray(value.models)) return undefined;
-
-	const selectors: string[] = [];
-	for (const model of value.models) {
-		const selector = normalizeSelector(model);
-		if (selector === undefined || selectors.includes(selector)) continue;
-		selectors.push(selector);
-		if (selectors.length === MAX_MODEL_SELECTORS) break;
-	}
-	return selectors;
+	// This extension only decides precedence. The companion owns the actual
+	// selector list, including deduplication and its model-attempt limit.
+	return value.models.some(model => normalizeSelector(model) !== undefined);
 }
 
-function readPolicySelectors(configPath: string): string[] | undefined {
+function readPolicySelection(configPath: string): boolean | undefined {
 	let fd: number | undefined;
 	try {
 		fd = openSync(configPath, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
@@ -74,7 +67,7 @@ function readPolicySelectors(configPath: string): string[] | undefined {
 			bytesRead += count;
 		}
 		if (bytesRead > MAX_POLICY_BYTES) return undefined;
-		return parsePolicySelectors(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")) as unknown);
+		return policyHasSelectors(JSON.parse(buffer.subarray(0, bytesRead).toString("utf8")) as unknown);
 	} catch {
 		// A malformed or unreadable policy must not prevent native compaction.
 		return undefined;
@@ -177,11 +170,11 @@ export function resolveCompactionModelPolicy(
 	candidates.push({ path: join(agentDir, PROJECT_POLICY), source: "agent-policy" });
 
 	for (const candidate of candidates) {
-		const selectors = readPolicySelectors(candidate.path);
+		const hasSelectors = readPolicySelection(candidate.path);
 		// A readable policy stops the search: an empty models list is an
 		// explicit choice to use no generic compaction model.
-		if (selectors !== undefined) {
-			return selectors.length > 0 ? { hasSelectors: true, source: candidate.source } : { hasSelectors: false };
+		if (hasSelectors !== undefined) {
+			return hasSelectors ? { hasSelectors: true, source: candidate.source } : { hasSelectors: false };
 		}
 	}
 	return { hasSelectors: false };

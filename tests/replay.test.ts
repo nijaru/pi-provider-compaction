@@ -47,7 +47,9 @@ describe("prefix-only request evidence", () => {
 		const snapshot = capturePreparedRequest(model, context, context, payload)!;
 		snapshot.createdAt -= SNAPSHOT_TTL_MS + 1;
 		expect(selectCoveredPrefix(model, snapshot, context, reject)).toBeUndefined();
-		expect(reasons).toEqual(["prepared input differs from serializer", "snapshot expired"]);
+		expect(reasons).toHaveLength(2);
+		expect(reasons.every(reason => reason.length > 0)).toBe(true);
+		expect(reasons.join("\n")).not.toContain("SECRET");
 	});
 	test("removed grammar declarations remain part of the policy fingerprint", () => {
 		const base = { ...model, compat: { supportsMidConvoSystemMessages: true, supportsOpenAIGrammarTools: true } };

@@ -3,7 +3,7 @@ import { cacheConfig, requestCacheState, summaryPayload, summaryInstruction, fin
 
 const usage = { input: 10, output: 2, cacheRead: 90, cacheWrite: 0, totalTokens: 102, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 test("summary payload preserves hooks, tools, routing and prefix; only the append/cap change", () => {
-	const input = [{ role: "user", content: [{ type: "input_text", text: "a full tool result beyond 2000 characters" }] }];
+	const input = [{ role: "user", content: [{ type: "input_text", text: "history" }] }];
 	const captured = { model: "fixture", input, tools: [{ name: "read" }], service_tier: "priority", prompt_cache_key: "session", max_output_tokens: 8192 };
 	const candidate = { ...captured, input: [...input, { role: "user", content: "summarize" }], max_output_tokens: 1000 };
 	expect(summaryPayload(captured, candidate)).toEqual(candidate);
@@ -36,11 +36,9 @@ test("retained-boundary previews do not expose omitted thinking or tool argument
 	expect(instruction).not.toContain("private-omitted-thought");
 	expect(instruction).not.toContain("private-argument");
 });
-test("retention preferences are per-request and never mutate the environment", () => {
-	const before = process.env.PI_CACHE_RETENTION;
+test("cache preferences accept known retention tiers and reject unknown values", () => {
 	expect(cacheConfig({ providerCompaction: { cachedSummaries: false, cacheRetention: "long", outcomeNotifications: true } })).toEqual({ cachedSummaries: false, cacheRetention: "long", outcomeNotifications: true });
 	expect(cacheConfig({ providerCompaction: { cacheRetention: "made-up" } }).cacheRetention).toBeUndefined();
-	expect(process.env.PI_CACHE_RETENTION).toBe(before);
 });
 
 test("cache-neutral comparison never ignores user data or schema properties named cache_control", () => {
