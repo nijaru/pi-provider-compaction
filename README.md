@@ -104,6 +104,25 @@ The manifest loads the built `dist/index.js`, including a bundled stateless Resp
 
 Tests include real Pi 1.4.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence and real idle-expiry transactions in both extension orders. Cached-summary fixtures also exercise built-in DeepSeek/Xiaomi dispatch, Anthropic Messages, late tool output, truncated-output fallback and measured usage. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration. `PI_PEAK_HOURS_FIXTURE_PATH` adds request-wide pricing checks in both extension orders, including warming, branch summaries, mixed-API dispatch and composition with `/fast`.
 
+
+### Bounded quality/cost evaluation
+
+```bash
+bun run tests/compaction-eval.ts --help
+bun run tests/compaction-eval.ts --dry-run
+bun run tests/compaction-eval.ts --live --model all --max-usd 0.50 --max-seconds 240 \
+  --out /tmp/compaction-eval.jsonl
+```
+
+The opt-in live run compares ordinary Pi summaries with cached portable summaries on direct DeepSeek Flash and MiMo Flash using existing authentication. Each model/strategy gets one attempt on one synthetic coding trace: a user constraint, a superseded decision, a late diagnostic beyond Pi's ordinary tool excerpt, and an unapplied fix. Both strategies include two warmup calls in their costs. No cache-miss retries, extra summary requests or cross-provider fallback are allowed.
+
+The harness caps summary output separately from `reserveTokens`, disables reasoning, and admits each actual request against a conservative total cost estimate and whole-run deadline. `--max-usd` cannot exceed $0.50. It records synthetic checkpoint text, literal fact presence in summary/continuation requests, strict answer-field checks, usage, catalog-estimated cost, latency and failure stage. JSONL output is private-permission and never overwritten; keep evaluation results outside the repository. Dry mode uses the real SDK/adapters with canned SSE and is plumbing validation only.
+
+This is a narrow, tail-heavy preservation probe, not a general quality benchmark or billing measurement. Literal presence is not semantic correctness; inspect the checkpoint, continuation request and answer separately. Codex/native is excluded because this harness cannot enforce a Remote V2 output bound. Smoke success or a successful rerun does not resolve intermittent quality failures.
+
+
+### Authenticated smoke tests
+
 Authenticated cached-summary smoke tests use synthetic history, including a value beyond the ordinary tool-result excerpt, and check continuation:
 
 ```bash
