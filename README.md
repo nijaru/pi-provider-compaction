@@ -14,7 +14,9 @@ Pi has replacement provider registration, not composable middleware. This extens
 - **Existing static legacy `streamSimple` registrations:** the original callback and configuration are retained. This includes `pi-fast-mode`'s Codex registration.
 - **Built-in and composed providers:** the existing provider object's full and simple streaming methods are leased separately, without re-registering the provider or rebuilding auth/catalog configuration. Each original method retains its receiver. Cleanup restores only still-owned methods; replacing the provider revokes observation until it is reacquired.
 
-Sessions sharing a model runtime share observation dispatchers, not their captured histories. Releasing one session's lease leaves the others active; the final lease restores the original provider.
+Sessions sharing a model runtime share observation dispatchers, not their captured histories. Leases are scoped to the provider/API dispatch path, including models.json APIs that bypass a native base. Releasing one session's lease leaves the others active; the final lease restores the original provider.
+
+With the current `pi-peak-hours` companion, the same dispatcher applies request-scoped pricing before terminal usage reaches consumers or cache evidence. This covers foreground responses, warming, portable/native compaction and branch summaries without stacking competing provider wrappers. The SDK's header-record identity establishes ownership for summaries with independent routing IDs; no header content is read, copied or changed. Unknown ownership stays unadjusted. Prices remain estimates, not invoices.
 
 For an eligible request, protocol selection is automatic:
 
@@ -63,7 +65,7 @@ Request-only suffix additions, deletions, redactions and reordering can survive 
 
 ## Safety and persistence
 
-Version 3 stores the portable summary, native output, usage, route identity and validated prefix metadata in one compaction entry. Both generation requests contribute to usage accounting. Raw credentials, complete auth headers and request snapshots are never persisted.
+Version 3 stores the portable summary, native output, usage, route identity and validated prefix metadata in one compaction entry. Both generation requests contribute to usage accounting, including reported native usage when checkpoint validation fails. Raw credentials, complete auth headers and request snapshots are never persisted.
 
 Native eligibility is deliberately **session-local and short-lived**. Restart, reload, SDK disposal, resume, fork, tree navigation, model changes, covered-history edits, and relevant prompt/tool/route changes revoke it. A credential refresh may conservatively revoke it too. Persisted native metadata alone is not authority to replay hidden content under a new runtime's privacy policy.
 
@@ -75,7 +77,7 @@ Legacy v1/v2 whole-history checkpoints remain inspectable but are never reinterp
 
 ## Diagnose portable fallback
 
-Run `/provider-compaction-status` to see observer/capture eligibility, estimated cache lifetime, the last selected path, elapsed time, reported input/cache/output tokens, and catalog-priced cost. Optional outcome notifications show measured usage after a committed compaction; hypothetical savings are not presented as measured. Failed/cancelled expiry attempts remain visible in runtime status; if no checkpoint is saved, their usage cannot be attached to compaction totals through Pi's extension API. Portable fallback also appends a `pi-provider-compaction:diagnostic` session entry containing only a fixed reason string. It is not included in model context. Diagnostics never include request content, credentials, or backend error text.
+Run `/provider-compaction-status` to see observer/capture eligibility, estimated cache lifetime, the last selected path, elapsed time, reported input/cache/output tokens, and estimated cost (including available companion corrections). Optional outcome notifications show measured usage after a committed compaction; hypothetical savings are not presented as measured. Failed/cancelled expiry attempts remain visible in runtime status; if no checkpoint is saved, their usage cannot be attached to compaction totals through Pi's extension API. Portable fallback also appends a `pi-provider-compaction:diagnostic` session entry containing only a fixed reason string. It is not included in model context. Diagnostics never include request content, credentials, or backend error text.
 
 These diagnostics require the extension to be loaded when the attempt happens; they cannot explain earlier compactions retroactively. A committed native checkpoint does not by itself prove that a later request replayed it.
 
@@ -100,7 +102,7 @@ pi --extension ./dist/index.js
 
 The manifest loads the built `dist/index.js`, including a bundled stateless Responses serializer validator; source or host dependency changes require a rebuild. `bun run check` rebuilds first and tests the artifact against Pi's actual host serializer, including function-call history replayed as grammar tools. Keep global installation disabled while testing. Publishing and global activation are separate approval steps.
 
-Tests include real Pi 1.4.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence and real idle-expiry transactions in both extension orders. Cached-summary fixtures also exercise built-in DeepSeek/Xiaomi dispatch, Anthropic Messages, late tool output, truncated-output fallback and measured usage. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration.
+Tests include real Pi 1.4.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence and real idle-expiry transactions in both extension orders. Cached-summary fixtures also exercise built-in DeepSeek/Xiaomi dispatch, Anthropic Messages, late tool output, truncated-output fallback and measured usage. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration. `PI_PEAK_HOURS_FIXTURE_PATH` adds request-wide pricing checks in both extension orders, including warming, branch summaries, mixed-API dispatch and composition with `/fast`.
 
 Authenticated cached-summary smoke tests use synthetic history, including a value beyond the ordinary tool-result excerpt, and check continuation:
 

@@ -29,7 +29,7 @@
     "build": "bun run build.ts",
     "prepack": "bun run build",
     "test": "bun test",
-    "lint": "oxlint build.ts index.ts protocol.ts policy.ts provider.ts replay.ts cached-summary.ts tests/",
+    "lint": "oxlint build.ts index.ts protocol.ts policy.ts provider.ts usage-observer.ts replay.ts cached-summary.ts tests/",
     "typecheck": "tsc --noEmit",
     "check": "bun run build && bun test && bun run lint && tsc --noEmit"
   },
@@ -39,6 +39,7 @@
     "protocol.ts",
     "policy.ts",
     "provider.ts",
+    "usage-observer.ts",
     "replay.ts",
     "cached-summary.ts",
     "README.md",

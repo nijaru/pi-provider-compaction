@@ -1,14 +1,27 @@
-import type { AssistantMessage, AssistantMessageEventStream, CacheRetention, Provider, StreamOptions, Model, TranscriptContext } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type AssistantMessage, type AssistantMessageEventStream, type CacheRetention, type Provider, type StreamOptions, type Model, type TranscriptContext } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+interface UsageScope { sessionId?: string; }
+const USAGE_OWNERS = Symbol.for("@nijaru/pi-provider-compaction/usage-owners");
+const usageGlobal = globalThis as typeof globalThis & { [USAGE_OWNERS]?: WeakMap<object, string> };
+const usageOwners = usageGlobal[USAGE_OWNERS] ??= new WeakMap<object, string>();
+
+/** Associate the SDK-owned header record without reading or changing any headers. */
+export function bindUsageHeaders(headers: object, sessionId: string): void {
+	usageOwners.set(headers, sessionId);
+}
 
 export type PayloadObserver = ((payload: unknown) => unknown | Promise<unknown>) & {
 	complete?: (message: AssistantMessage) => void;
+	/** Adjust only usage before any completion observer or consumer sees it. */
+	priceUsage?: (message: AssistantMessage) => void;
 	cacheRetention?: CacheRetention;
 };
-export type ObserveRequest = (model: Model<any>, context: TranscriptContext, options: StreamOptions) => PayloadObserver | undefined;
+export type ObserveRequest = (model: Model<any>, context: TranscriptContext, options: StreamOptions, scope: UsageScope) => PayloadObserver | undefined;
 
 export interface InstalledObserver {
 	provider: string;
+	/** installObserver leases one dispatch API; lower-level leases can be unscoped. */
+	api?: string;
 	isInstalled(): boolean;
 	remove(): void;
 }
@@ -18,11 +31,13 @@ export interface InstalledObserver {
 export const STREAM_OBSERVER = Symbol.for("@nijaru/pi-provider-compaction/stream-observer");
 
 function observedStream<T extends StreamOptions>(model: Model<any>, context: TranscriptContext, options: T | undefined, observe: ObserveRequest, dispatch: (options: T | undefined) => AssistantMessageEventStream): AssistantMessageEventStream {
+	const headerOwner = options?.headers ? usageOwners.get(options.headers) : undefined;
+	const scope: UsageScope = { sessionId: headerOwner ?? options?.sessionId };
 	let handler: ReturnType<ObserveRequest>;
-	try { handler = observe(model, context, options ?? {}); }
+	try { handler = observe(model, context, options ?? {}, scope); }
 	catch { return dispatch(options); } // An expired optional observer must not veto dispatch.
 	if (!handler) return dispatch(options);
-	const stream = dispatch({
+	const run = () => dispatch({
 		...options,
 		...(handler.cacheRetention === undefined ? {} : { cacheRetention: handler.cacheRetention }),
 		onPayload: async (payload: unknown, requestModel: Model<any>) => {
@@ -32,16 +47,52 @@ function observedStream<T extends StreamOptions>(model: Model<any>, context: Tra
 			try { return await handler(prepared); } catch { return prepared; }
 		},
 	} as T);
-	// result() observes completion without consuming the public event iterator.
+	const stream = run();
+	if (handler.priceUsage) return pricedStream(stream, model, handler);
+	// Pure capture remains transparent, including the original stream identity.
 	if (handler.complete) void stream.result().then(handler.complete).catch(() => {});
 	return stream;
+}
+
+/** Pricing must precede both terminal-event delivery and result() resolution. */
+function pricedStream(stream: AssistantMessageEventStream, model: Model<any>, handler: PayloadObserver): AssistantMessageEventStream {
+	const out = createAssistantMessageEventStream();
+	void (async () => {
+		let final: AssistantMessage | undefined;
+		let partial: AssistantMessage | undefined;
+		try {
+			for await (const event of stream) {
+				if ("partial" in event) partial = event.partial;
+				if (event.type === "done" || event.type === "error") {
+					final = event.type === "done" ? event.message : event.error;
+					try { handler.priceUsage?.(final); } catch { /* Optional estimates never veto completion. */ }
+					try { handler.complete?.(final); } catch { /* Capture failure never vetoes completion. */ }
+				}
+				out.push(event);
+			}
+			if (final) { out.end(final); return; }
+		} catch { /* Malformed plugin streams still need a terminal outcome. */ }
+		const message: AssistantMessage = {
+			...(partial ?? {
+				role: "assistant", api: model.api, provider: model.provider, model: model.id,
+				content: [], timestamp: Date.now(),
+				usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
+			}),
+			stopReason: "error", errorMessage: "Provider stream ended before a terminal event",
+		};
+		try { handler.priceUsage?.(message); } catch { /* Preserve the known usage on pricing failure. */ }
+		out.push({ type: "error", reason: "error", error: message });
+		out.end(message);
+	})();
+	return out;
 }
 
 /** One dispatch layer, with session-local selection and no released lease history. */
 function observerLeases(provider: string, owned: () => boolean, restore: () => void) {
 	const leases = new Map<symbol, { observe: ObserveRequest; current: () => boolean }>();
 	let closed = false;
-	const active = (token: symbol) => !closed && leases.get(token)?.current() === true && owned();
+	const live = (token: symbol) => !closed && leases.has(token);
+	const active = (token: symbol) => live(token) && leases.get(token)?.current() === true && owned();
 	const release = () => {
 		if (closed) return;
 		closed = true;
@@ -57,6 +108,10 @@ function observerLeases(provider: string, owned: () => boolean, restore: () => v
 				if (!handler) continue;
 				handlers.push(Object.assign((payload: unknown) => active(token) ? handler(payload) : payload, {
 					cacheRetention: handler.cacheRetention,
+					// A catalog/API recomposition may detach a provider after dispatch.
+					// Its in-flight bill still uses the sampled policy; explicit lease
+					// removal/disposal, unlike recomposition, revokes that callback.
+					priceUsage: handler.priceUsage ? (message: AssistantMessage) => { if (live(token)) handler.priceUsage!(message); } : undefined,
 					complete: handler.complete ? (message: AssistantMessage) => { if (active(token)) handler.complete!(message); } : undefined,
 				}));
 			} catch { /* A failed optional observer must not disable the other sessions. */ }
@@ -72,6 +127,11 @@ function observerLeases(provider: string, owned: () => boolean, restore: () => v
 			return payload;
 		}, {
 			cacheRetention: [...handlers].reverse().find((handler) => handler.cacheRetention !== undefined)?.cacheRetention,
+			priceUsage: handlers.some((handler) => handler.priceUsage) ? (message: AssistantMessage) => {
+				for (const handler of handlers) {
+					try { handler.priceUsage?.(message); } catch { /* Isolate independent pricing owners. */ }
+				}
+			} : undefined,
 			complete: handlers.some((handler) => handler.complete) ? (message: AssistantMessage) => {
 				for (const handler of handlers) {
 					try { handler.complete?.(message); } catch { /* Isolate optional completion observers too. */ }
@@ -168,20 +228,27 @@ export function leaseEffectiveProvider(base: Provider | undefined, current: () =
 	* delegate their original callback (including /fast). Never register an effective
 	* composed provider as a native base: that loses model headers and freezes config.
 	*/
-export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe: ObserveRequest): InstalledObserver | undefined {
+export function installObserver(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "model" | "modelRegistry">, observe: ObserveRequest): InstalledObserver | undefined {
 	const model = ctx.model;
 	if (!model) return;
 	const registry = ctx.modelRegistry;
 	const id = model.provider;
+	const observeApi: ObserveRequest = (requestModel, ...args) => requestModel.api === model.api ? observe(requestModel, ...args) : undefined;
+	const tagged = (lease: InstalledObserver | undefined) => lease ? Object.assign(lease, { api: model.api }) : undefined;
+	const effective = () => {
+		const base = registry.getProvider(id);
+		if (!base?.getModels().some((entry) => entry.api === model.api)) return;
+		return tagged(leaseEffectiveProvider(base, () => registry.getProvider(id), observeApi));
+	};
 	const native = registry.getRegisteredNativeProvider(id);
 	if (native) {
 		// Pi composes a native base only when its catalog serves the active API.
 		// Otherwise the request goes to the global API provider and bypasses this
 		// wrapper; claiming an observer there would report native compaction as
 		// installed while never capturing anything.
-		if (typeof native.getModels !== "function" || !native.getModels().some((entry) => entry.api === model.api)) return;
+		if (typeof native.getModels !== "function" || !native.getModels().some((entry) => entry.api === model.api)) return effective();
 		const existing = nativeLeases.get(native);
-		if (existing) return existing.add(observe);
+		if (existing) return tagged(existing.add(observeApi));
 		const leases = observerLeases(id, () => registry.getRegisteredNativeProvider(id) === wrapper, () => {
 			// Keep cleanup usable after bare SDK disposal invalidates the extension API.
 			if (registry.getRegisteredNativeProvider(id) === wrapper) registry.registerProvider(native);
@@ -190,7 +257,7 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 		const wrapper = decorateProvider(native, leases.observe);
 		nativeLeases.set(wrapper, leases);
 		pi.registerProvider(wrapper);
-		return leases.add(observe);
+		return tagged(leases.add(observeApi));
 	}
 	const original = registry.getRegisteredProviderConfig(id);
 	// Refresh callbacks own mutable catalog state inside the composer. Replacing
@@ -198,12 +265,12 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 	if (!original?.streamSimple || original.refreshModels || original.oauth?.modifyModels || original.api !== model.api) {
 		// Lease the effective object's methods, NOT its registry slot. Re-registering
 		// a composed provider freezes catalogs and loses overlay/header semantics.
-		return leaseEffectiveProvider(registry.getProvider(id), () => registry.getProvider(id), observe);
+		return effective();
 	}
 	// An injected legacy streamSimple overlay would also intercept full stream()
 	// calls and change reasoning semantics. Only decorate an existing stream owner.
 	const existing = legacyLeases.get(original.streamSimple);
-	if (existing) return existing.add(observe);
+	if (existing) return tagged(existing.add(observeApi));
 	const delegate = original.streamSimple.bind(original);
 	const owned = () => registry.getRegisteredProviderConfig(id)?.streamSimple === wrapper && !registry.getRegisteredNativeProvider(id);
 	const leases = observerLeases(id, owned, () => {
@@ -219,5 +286,5 @@ export function installObserver(pi: ExtensionAPI, ctx: ExtensionContext, observe
 	Object.defineProperty(wrapper, STREAM_OBSERVER, { value: { delegate: original.streamSimple, release: leases.release } });
 	legacyLeases.set(wrapper, leases);
 	pi.registerProvider(id, { ...original, streamSimple: wrapper });
-	return leases.add(observe);
+	return tagged(leases.add(observeApi));
 }

@@ -208,7 +208,7 @@ async function collectProviderUsage(stream: AssistantMessageEventStream, signal:
 	let usage: Usage | undefined;
 	for await (const event of stream) {
 		if (signal.aborted) throw new DOMException("Compaction aborted", "AbortError");
-		if (event.type === "error") throw new Error(event.error.errorMessage ?? "Native compaction provider request failed");
+		if (event.type === "error") throw new NativeCompactionValidationError("Native compaction provider stream failed", event.error.usage);
 		if (event.type === "done") usage = event.message.usage;
 	}
 	if (!usage) throw new Error("Native compaction provider stream ended without usage");
@@ -227,6 +227,7 @@ interface TransportRequest {
 	env?: Record<string, string>;
 	/** Cost-relevant request option captured with the original request. */
 	serviceTier?: string;
+	sessionId?: string;
 	signal: AbortSignal;
 	/** Revalidate request ownership after asynchronous provider preparation. */
 	isCurrent?: () => boolean;
@@ -252,7 +253,7 @@ export interface TransportResponse {
 
 async function requestResponsesCompact(request: TransportRequest): Promise<TransportResponse> {
 	let preparedPayload: JsonObject | undefined;
-	let compacted: { response: JsonObject; output: ResponseItem[] } | undefined;
+	let compacted: ResponseItem[] | undefined;
 	let bridgeError: unknown;
 	let dispatches = 0;
 	const baseFetch = request.fetch ?? globalThis.fetch;
@@ -274,13 +275,13 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 			});
 			if (!response.ok) return response;
 			const parsed = await readJsonBounded(response, request.signal);
-			try {
-				if (!isObject(parsed)) throw new Error("Responses Compact returned a non-object response");
-				compacted = { response: parsed, output: validateCompactedOutput(parsed) };
-			} catch (error) {
-				throw new NativeCompactionValidationError(error instanceof Error ? error.message : String(error));
-			}
-			return syntheticCompletion(parsed, preparedPayload);
+			if (!isObject(parsed)) throw new Error("Responses Compact returned a non-object response");
+			// Let the SDK normalize and price reported usage even when the returned
+			// checkpoint is invalid. A synthetic HTTP error would discard that bill.
+			const completion = syntheticCompletion(parsed, preparedPayload);
+			try { compacted = validateCompactedOutput(parsed); }
+			catch (error) { bridgeError = new NativeCompactionValidationError(error instanceof Error ? error.message : String(error)); }
+			return completion;
 		} catch (error) {
 			bridgeError = error;
 			return errorResponse(error);
@@ -296,6 +297,7 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 		transport: "sse",
 		cacheRetention: "none",
 		maxRetries: 0,
+		sessionId: request.sessionId,
 		fetch: bridgeFetch,
 		onPayload: (payload: unknown) => {
 			assertCurrent(request);
@@ -307,13 +309,13 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 	});
 
 	const usage = await collectProviderUsage(stream, request.signal).catch((error) => {
-		if (bridgeError) throw bridgeError;
+		if (bridgeError) throw new NativeCompactionValidationError("Native compaction transport or validation failed", error instanceof NativeCompactionValidationError ? error.usage : undefined);
 		throw error;
 	});
 	if (bridgeError instanceof NativeCompactionValidationError) throw new NativeCompactionValidationError(bridgeError.message, usage);
 	if (bridgeError) throw bridgeError;
 	if (!compacted || dispatches !== 1) throw new Error("Responses Compact did not complete exactly one request");
-	return { output: compacted.output, usage };
+	return { output: compacted, usage };
 }
 
 interface CollectedSse {
@@ -438,6 +440,7 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 		transport: "sse",
 		cacheRetention: "none",
 		maxRetries: 0,
+		sessionId: request.sessionId,
 		fetch: inspectedFetch,
 		onPayload: (payload: unknown) => {
 			assertCurrent(request);
@@ -449,9 +452,9 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 	});
 	try {
 		const usage = await collectProviderUsage(stream, request.signal);
-		if (!sentInput || inspections.length !== 1) throw new Error(`Remote V2 observed ${inspections.length} successful provider responses; expected exactly one`);
+		if (!sentInput || inspections.length !== 1) throw new NativeCompactionValidationError(`Remote V2 observed ${inspections.length} successful provider responses; expected exactly one`, usage);
 		const inspection = await inspections[0]!;
-		if ("error" in inspection) throw inspection.error;
+		if ("error" in inspection) throw new NativeCompactionValidationError("Remote V2 checkpoint validation failed", usage);
 		return { output: buildRemoteV2History(sentInput, inspection.result.item), usage };
 	} finally {
 		controller.abort();

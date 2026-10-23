@@ -4,7 +4,8 @@ import { normalizeContext, registerSessionResourceCleanup, type Model, type Prov
 import { compact, convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
 import { resolveCompactionModelPolicy } from "./policy";
 import { cacheConfig, cachedSummary, captureCachedRequest, finishCachedRequest, requestCacheState, sameCachedPrompt, supportsCachedSummary, withFileTracking, type CachedRequest } from "./cached-summary";
-import { installObserver, type InstalledObserver, type ObserveRequest } from "./provider";
+import { bindUsageHeaders, installObserver, type InstalledObserver, type ObserveRequest } from "./provider";
+import { serveUsageObservers } from "./usage-observer";
 import { capturePreparedRequest, equal, requestPolicy, selectCoveredPrefix, substituteSummary, summarySlot, type PreparedRequest } from "./replay";
 import { isObject, NativeCompactionValidationError, requestProviderCompaction, resolveNativeProtocol, supportsResponsesApi, validateCompactedOutput, type NativeProtocol, type ResponseItem } from "./protocol";
 
@@ -161,9 +162,10 @@ export default function (pi: ExtensionAPI): void {
 	const routeDigest = (value: unknown) => createHmac("sha256", secret).update(JSON.stringify(value)).digest("hex");
 	let runtimeId = randomUUID();
 	let ctx: ExtensionContext | undefined;
+	let usageObservers = serveUsageObservers(pi, () => ctx);
 	let snapshot: Captured | undefined;
 	let cache: CachedRequest | undefined;
-	let summarizing = false;
+	let compactionRequest = false;
 	let expiryAttempt: ExpiryAttempt | undefined;
 	let lastOutcome: { path: string; elapsedMs: number; usage?: Usage; reason?: string } | undefined;
 	let active: Active | undefined;
@@ -183,11 +185,12 @@ export default function (pi: ExtensionAPI): void {
 			const state = cacheState(context);
 			const remaining = state.expiresAt === undefined ? "unknown lifetime" : `estimated ${Math.max(0, Math.ceil((state.expiresAt - Date.now()) / 1000))}s remaining (model declaration; best effort)`;
 			const usage = lastOutcome?.usage;
-			context.ui.notify(`Provider compaction\nObserver: ${observer?.isInstalled() ? "installed" : "unavailable for current registration"}\nCapture: ${captureStatus}\nCache: ${state.reason}; ${remaining}\nLast attempt: ${compactionStatus}${lastOutcome ? `\nOutcome: ${lastOutcome.path}, ${lastOutcome.elapsedMs}ms${usage ? `; input ${usage.input}, cache read ${usage.cacheRead}, write ${usage.cacheWrite}, output ${usage.output}; catalog cost $${usage.cost.total.toFixed(6)}` : "; usage unavailable"}${lastOutcome.reason ? `; ${lastOutcome.reason}` : ""}` : ""}`, "info");
+			context.ui.notify(`Provider compaction\nObserver: ${observer?.isInstalled() ? "installed" : "unavailable for current registration"}\nCapture: ${captureStatus}\nCache: ${state.reason}; ${remaining}\nLast attempt: ${compactionStatus}${lastOutcome ? `\nOutcome: ${lastOutcome.path}, ${lastOutcome.elapsedMs}ms${usage ? `; input ${usage.input}, cache read ${usage.cacheRead}, write ${usage.cacheWrite}, output ${usage.output}; estimated cost $${usage.cost.total.toFixed(6)}` : "; usage unavailable"}${lastOutcome.reason ? `; ${lastOutcome.reason}` : ""}` : ""}`, "info");
 		},
 	});
 	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; cache = undefined; active = undefined; pending = undefined; expiryAttempt = undefined; captureStatus = "invalidated by lifecycle/history/policy change"; };
 	const retire = () => {
+		usageObservers.clear();
 		invalidate();
 		const installed = observer;
 		observer = undefined; ctx = undefined;
@@ -195,6 +198,12 @@ export default function (pi: ExtensionAPI): void {
 		installed?.remove();
 		lastOutcome = undefined;
 	};
+	pi.on("before_provider_headers", (event, context) => {
+		bindUsageHeaders(event.headers, context.sessionManager.getSessionId());
+		// Lazy API loading or catalog refresh can recompose effective providers
+		// between auxiliary calls that have no before_agent_start boundary.
+		usageObservers.ready(context);
+	});
 	const generic = (context: ExtensionContext) => resolveCompactionModelPolicy(pi, context).hasSelectors;
 	const route = (model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions) => routeDigest({ model, apiKey: options.apiKey, headers: options.headers, env: options.env });
 	const unchanged = (branch: readonly SessionEntry[], length: number, hash: string) => branch.length >= length && digest(branch.slice(0, length)) === hash && !branch.slice(length).some((entry) => entry.type === "context_edit");
@@ -250,7 +259,7 @@ export default function (pi: ExtensionAPI): void {
 			return;
 		}
 		if (options.sessionId !== manager.getSessionId()) return;
-		if (summarizing) return;
+		if (compactionRequest) return;
 		if (!supportsNativeCompaction(model) && !supportsCachedSummary(model)) { captureRejected("unsupported API"); return; }
 		if (!options.onPayload) {
 			// The portable-summary request re-enters this observer without a payload
@@ -346,27 +355,31 @@ export default function (pi: ExtensionAPI): void {
 
 	const install = (context: ExtensionContext) => {
 		ctx = context;
-		if (observer?.provider === context.model?.provider && observer?.isInstalled()) return;
+		if (observer?.provider === context.model?.provider && observer?.api === context.model?.api && observer?.isInstalled()) return;
 		if (observer) { invalidate(); observer.remove(); observer = undefined; }
 		if (!supportsNativeCompaction(context.model) && !supportsCachedSummary(context.model)) return;
 		observer = installObserver(pi, context, observe);
 		captureStatus = observer ? "awaiting prepared request" : "unsupported provider registration";
 	};
 	pi.on("session_start", (_event, context) => {
-		retire(); install(context);
+		retire();
+		usageObservers.dispose();
+		usageObservers = serveUsageObservers(pi, () => ctx);
+		install(context);
+		usageObservers.ready(context);
 		const sessionId = context.sessionManager.getSessionId();
 		// AgentSession.dispose() cleans session resources even without emitting
 		// session_shutdown. The captured registry keeps owned cleanup usable.
 		unregisterCleanup = registerSessionResourceCleanup((disposedId) => {
-			if (disposedId === undefined || disposedId === sessionId) retire();
+			if (disposedId === undefined || disposedId === sessionId) { retire(); usageObservers.dispose(); }
 		});
 		const latest = latestCompaction(context.sessionManager.getBranch());
 		if (latest?.summary === NATIVE_COMPACTION_SUMMARY) context.ui.notify("Legacy native compaction has no portable summary. Native replay is disabled; recover from earlier history or start a new session.", "warning");
 	});
-	pi.on("before_agent_start", (_event, context) => { install(context); });
-	pi.on("model_select", (_event, context) => { invalidate(); install(context); });
+	pi.on("before_agent_start", (_event, context) => { install(context); usageObservers.ready(context); });
+	pi.on("model_select", (_event, context) => { invalidate(); install(context); usageObservers.ready(context); });
 	pi.on("session_tree", () => { invalidate(); });
-	pi.on("session_shutdown", retire);
+	pi.on("session_shutdown", () => { retire(); usageObservers.dispose(); });
 	// Privacy-policy owners must invalidate before changing a policy that can affect
 	// hidden covered history. Arbitrary dynamic privacy compositions are unsupported.
 	const removeInvalidation = pi.events.on("pi-provider-compaction:invalidate", invalidate);
@@ -419,14 +432,14 @@ export default function (pi: ExtensionAPI): void {
 		let summaryReason: string | undefined;
 		if (cached) {
 			compactionStatus = "generating cached portable summary";
-			summarizing = true;
+			compactionRequest = true;
 			try {
 				const result = await cachedSummary(cached, context, event.preparation, event.customInstructions, event.signal, current);
 				portable = result.result;
 				attemptedUsage = result.usage;
 				summaryReason = result.reason;
 				if (portable) summaryPath = "cached";
-			} finally { summarizing = false; }
+			} finally { compactionRequest = false; }
 			if (!current()) return cancelled(attemptedUsage);
 		}
 		if (!portable) {
@@ -458,13 +471,17 @@ export default function (pi: ExtensionAPI): void {
 			if (!current()) return cancelled(portable.usage);
 			if (!freshAuth.ok || routeDigest(freshAuth) !== capture.authHash) { fallback("auth changed after portable generation"); return outcome(summaryPath, portable, "native auth changed"); }
 			compactionStatus = "requesting native checkpoint";
-			const native = await requestProviderCompaction({
-				provider: capture.provider, model: capture.model, context: capture.prepared.context,
-				input, preparedPayload: capture.prepared.payload, protocol,
-				apiKey: capture.options.apiKey, headers: capture.options.headers, env: capture.options.env,
-				signal: event.signal, isCurrent: current, fetch: capture.options.fetch,
-				...(capture.options.serviceTier === undefined ? {} : { serviceTier: capture.options.serviceTier }),
-			});
+			let native: Awaited<ReturnType<typeof requestProviderCompaction>>;
+			compactionRequest = true;
+			try {
+				native = await requestProviderCompaction({
+					provider: capture.provider, model: capture.model, context: capture.prepared.context,
+					input, preparedPayload: capture.prepared.payload, protocol,
+					apiKey: capture.options.apiKey, headers: capture.options.headers, env: capture.options.env,
+					signal: event.signal, isCurrent: current, fetch: capture.options.fetch, sessionId: source.sessionId,
+					...(capture.options.serviceTier === undefined ? {} : { serviceTier: capture.options.serviceTier }),
+				});
+			} finally { compactionRequest = false; }
 			if (!current()) return cancelled(combineUsage(native.usage, portable.usage));
 			const finalAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
 			if (!current()) return cancelled(combineUsage(native.usage, portable.usage));
@@ -500,7 +517,7 @@ export default function (pi: ExtensionAPI): void {
 		else if (owned) compactionStatus = `${lastOutcome!.path} portable summary committed`;
 		else fallback("another handler supplied the committed result");
 		if (owned) {
-			if (configuration().outcomeNotifications && lastOutcome) context.ui.notify(`Compacted via ${lastOutcome.path} in ${(lastOutcome.elapsedMs / 1000).toFixed(1)}s${lastOutcome.usage ? `; cache read ${lastOutcome.usage.cacheRead}, write ${lastOutcome.usage.cacheWrite}; catalog cost $${lastOutcome.usage.cost.total.toFixed(6)}` : ""}`, "info");
+			if (configuration().outcomeNotifications && lastOutcome) context.ui.notify(`Compacted via ${lastOutcome.path} in ${(lastOutcome.elapsedMs / 1000).toFixed(1)}s${lastOutcome.usage ? `; cache read ${lastOutcome.usage.cacheRead}, write ${lastOutcome.usage.cacheWrite}; estimated cost $${lastOutcome.usage.cost.total.toFixed(6)}` : ""}`, "info");
 		} else lastOutcome = { path: "Pi/other handler", elapsedMs: 0, usage: event.compactionEntry.usage, reason: compactionStatus };
 		// Only static diagnostics are persisted, never request/auth data or error text.
 		if (fallbackReason) pi.appendEntry("pi-provider-compaction:diagnostic", { status: `portable: ${fallbackReason}` });

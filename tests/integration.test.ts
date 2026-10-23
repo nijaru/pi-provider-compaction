@@ -31,14 +31,14 @@ function completion(text: string, cached = false, truncated = false): Response {
 	];
 	return new Response(events.map((event) => `data: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 }
-async function loadExternalExtension(path: string): Promise<(pi: ExtensionAPI) => void> {
+async function loadExternalExtension(path: string): Promise<(pi: ExtensionAPI, options?: { configPath: string }) => void> {
 	// Extracted packages need the same host bindings Pi supplies at runtime.
 	const built = await Bun.build({ entrypoints: [path], target: "bun", packages: "external", plugins: [{ name: "pi-host-bindings", setup(build) { build.onResolve({ filter: /^@earendil-works\// }, ({ path }) => ({ path: import.meta.resolve(path), external: true })); } }] });
 	if (!built.success) throw new Error(`Could not load extension fixture: ${path}`);
 	return (await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`)).default;
 }
 
-async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; firstHooks?: (pi: ExtensionAPI) => void; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean; cached?: boolean; cacheTtl?: number; settings?: Record<string, unknown>; beforeReply?: (body: any) => void; builtin?: string; summaryLength?: boolean; minimumSummaryTokens?: number; seed?: (manager: SessionManager, model: Model<any>) => void } = {}) {
+async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; firstHooks?: (pi: ExtensionAPI) => void; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; invalidNative?: boolean; mixedApis?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean; cached?: boolean; cacheTtl?: number; settings?: Record<string, unknown>; beforeReply?: (body: any) => void; builtin?: string; summaryLength?: boolean; minimumSummaryTokens?: number; cost?: Model<any>["cost"]; seed?: (manager: SessionManager, model: Model<any>) => void } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "provider-compaction-fixture-"));
 	const requests: { url: string; body: any; headers: Headers }[] = [];
 	const authControl: { key: string; beforeResolve?: () => void; beforeNative?: () => void } = { key: "fixture" };
@@ -49,13 +49,13 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 		const body = JSON.parse(headers.get("content-encoding") === "zstd" ? zstdDecompressSync(init!.body as Uint8Array).toString() : String(init?.body));
 		requests.push({ url, body, headers: new Headers(init?.headers) });
 		if (new URL(url).pathname.endsWith("/compact")) authControl.beforeNative?.();
-		if (new URL(url).pathname.endsWith("/compact")) return options.nativeFailure ? Response.json({ error: { message: "fixture failure" } }, { status: 400 }) : Response.json({ output: [checkpoint], usage });
+		if (new URL(url).pathname.endsWith("/compact")) return options.nativeFailure ? Response.json({ error: { message: "fixture failure" } }, { status: 400 }) : Response.json({ output: options.invalidNative ? [] : [checkpoint], usage });
 		if (body.input?.some((item: any) => item.type === "compaction_trigger")) {
-			const response = { id: "resp_native", status: "completed", output: [checkpoint], usage };
+			const response = { id: "resp_native", status: "completed", output: options.invalidNative ? [] : [checkpoint], usage };
 			return new Response(`data: ${JSON.stringify({ type: "response.completed", response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
 		}
 		await options.beforeReply?.(body);
-		if (options.api === "openai-completions") {
+		if (options.api === "openai-completions" && !body.input) {
 			const chunks = [{ choices: [{ index: 0, delta: { role: "assistant", content: "Portable summary fixture" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24, prompt_tokens_details: { cached_tokens: options.cached ? 15 : 0 } } }];
 			return new Response(chunks.map((chunk) => `data: ${JSON.stringify({ id: "chatcmpl_fixture", model: "fixture", ...chunk })}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
 		}
@@ -68,10 +68,12 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 		const truncated = options.summaryLength && JSON.stringify(body).includes("retained-boundary") || summary && options.minimumSummaryTokens !== undefined && typeof cap === "number" && cap < options.minimumSummaryTokens;
 		return completion("Portable summary fixture", options.cached, truncated);
 	}) as typeof fetch;
-	const model: Model<any> = { provider: options.builtin ?? (options.fastFactory ? "openai-codex" : "fixture"), api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-5.5" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: options.thinking ?? false, ...(options.cacheTtl ? { promptCache: { short: options.cacheTtl, long: options.cacheTtl * 2 } } : {}), compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+	const model: Model<any> = { provider: options.builtin ?? (options.fastFactory ? "openai-codex" : "fixture"), api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-6.1-sol" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: options.thinking ?? false, ...(options.cacheTtl ? { promptCache: { short: options.cacheTtl, long: options.cacheTtl * 2 } } : {}), compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: options.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 	const credentials = new InMemoryCredentialStore();
-	if (options.builtin) await credentials.modify(model.provider, async () => ({ type: "api_key", key: "fixture" }));
-	const runtime = await ModelRuntime.create({ credentials, modelsPath: null, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false });
+	if (options.builtin || options.mixedApis) await credentials.modify(model.provider, async () => ({ type: "api_key", key: "fixture" }));
+	const modelsPath = options.mixedApis ? join(directory, "models.json") : null;
+	if (modelsPath) await writeFile(modelsPath, JSON.stringify({ providers: { [model.provider]: { models: [{ id: "aux-responses", api: "openai-responses", contextWindow: model.contextWindow, maxTokens: model.maxTokens, cost: model.cost }] } } }));
+	const runtime = await ModelRuntime.create({ credentials, modelsPath, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false });
 	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "openai-completions" ? openAICompletionsApi() : options.api === "anthropic-messages" ? anthropicMessagesApi() : options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
 	const legacyStream = provider.streamSimple.bind(provider);
 	if (options.fastFactory) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`, models: [model] });
@@ -189,11 +191,16 @@ describe("Pi runner + real Responses adapter", () => {
 			await mkdir(join(agentDir, "extensions"));
 			await writeFile(join(agentDir, "extensions", "pi-fast-mode.json"), JSON.stringify({ active: true }));
 			process.env.PI_CODING_AGENT_DIR = agentDir;
-			f = await fixture({ api: "openai-codex-responses", fastFactory });
+			const peak = process.env.PI_PEAK_HOURS_FIXTURE_PATH ? await loadExternalExtension(process.env.PI_PEAK_HOURS_FIXTURE_PATH) : undefined;
+			const peakConfig = join(agentDir, "peak.json");
+			await writeFile(peakConfig, JSON.stringify({ schedules: [{ providers: ["openai-codex"], outside: 0.5 }] }));
+			f = await fixture({ api: "openai-codex-responses", fastFactory, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 }, ...(peak ? { hooks: (pi) => peak(pi, { configPath: peakConfig }) } : {}) });
 			await f.session.prompt("A ".repeat(1000));
 			await f.session.prompt("B ".repeat(100));
 			const result = await f.session.compact();
 			expect((result.details as any).version).toBe(3);
+			const expected = (20 * 1 + 4 * 2) / 1e6 * 2.5 * (peak ? 0.5 : 1);
+			expect(result.usage?.cost.total).toBeCloseTo(expected * 2, 12);
 			await f.session.prompt("C new");
 			expect(f.requests.at(-1)!.body.input).toContainEqual(checkpoint);
 			expect(f.requests.at(-1)!.body.service_tier).toBe("priority");
@@ -497,8 +504,8 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});
-	test.each(["rejected", "auth changed"])("native fallback preserves portable work and billed usage: %s", async mode => {
-		const f = await fixture({ nativeFailure: mode === "rejected" });
+	test.each(["rejected", "auth changed", "invalid compact output", "invalid remote checkpoint"])("native fallback preserves portable work and billed usage: %s", async mode => {
+		const f = await fixture({ nativeFailure: mode === "rejected", invalidNative: mode.startsWith("invalid"), api: mode === "invalid remote checkpoint" ? "openai-codex-responses" : undefined });
 		try {
 			await f.session.prompt("A ".repeat(1000));
 			await f.session.prompt("B ".repeat(100));
@@ -510,7 +517,7 @@ describe("Pi runner + real Responses adapter", () => {
 			expect((result.details as any).type).toBeUndefined();
 			expect(result.usage?.input).toBe(mode === "rejected" ? 20 : 40);
 			expect(result.usage?.output).toBe(mode === "rejected" ? 4 : 8);
-			const reason = mode === "rejected" ? "native acquisition or validation failed" : "auth changed after native generation";
+			const reason = mode === "auth changed" ? "auth changed after native generation" : "native acquisition or validation failed";
 			expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({ data: { status: `portable: ${reason}` } });
 			const notices: string[] = [];
 			const command = f.session.extensionRunner.getCommand("provider-compaction-status")!;
@@ -522,6 +529,75 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(JSON.stringify(f.requests.at(-1)!.body)).not.toContain("pi-provider-compaction:diagnostic");
 		} finally { await f.close(); }
 	});
+});
+
+describe("request-wide time-of-day pricing", () => {
+	test.skipIf(!process.env.PI_PEAK_HOURS_FIXTURE_PATH)("mixed-API auxiliary calls survive lazy provider recomposition", async () => {
+		const peak = await loadExternalExtension(process.env.PI_PEAK_HOURS_FIXTURE_PATH!);
+		const configDir = await mkdtemp(join(tmpdir(), "provider-peak-mixed-"));
+		const configPath = join(configDir, "peak.json");
+		await writeFile(configPath, JSON.stringify({ schedules: [{ providers: ["fixture"], outside: 0.5 }] }));
+		const f = await fixture({ api: "openai-completions", mixedApis: true, cached: true, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 }, hooks: (pi) => peak(pi, { configPath }) });
+		try {
+			await f.session.prompt("A ".repeat(100));
+			const model = f.runtime.getModel("fixture", "aux-responses")!;
+			for (let index = 0; index < 3; index++) {
+				const reply = await f.runtime.streamSimple(model, normalizeContext({ messages: [{ role: "user", content: "Auxiliary work", timestamp: Date.now() }] }), {
+					sessionId: "independent-summary-routing",
+					transformHeaders: (headers) => f.session.extensionRunner.emitBeforeProviderHeaders(headers),
+				}).result();
+				expect(reply.stopReason).toBe("stop");
+				expect(reply.usage.cost.total).toBeCloseTo((5 + 15 * 0.5 + 4 * 2) / 1e6 * 0.5, 12);
+			}
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); await rm(configDir, { recursive: true, force: true }); }
+	});
+	for (const api of ["openai-completions", "openai-responses"] as const) for (const hooksFirst of [false, true]) {
+		test.skipIf(!process.env.PI_PEAK_HOURS_FIXTURE_PATH)(`prices foreground, warming, compaction and branch usage once (${api}, peak first=${hooksFirst})`, async () => {
+			const peak = await loadExternalExtension(process.env.PI_PEAK_HOURS_FIXTURE_PATH!);
+			const configDir = await mkdtemp(join(tmpdir(), "provider-peak-"));
+			const configPath = join(configDir, "peak.json");
+			await writeFile(configPath, JSON.stringify({ schedules: [{ providers: ["fixture"], outside: 0.5 }] }));
+			let sent: any;
+			const f = await fixture({
+				api, cached: true, hooksFirst, cost: { input: 1, output: 2, cacheRead: 0.5, cacheWrite: 0 },
+				hooks(pi) {
+					peak(pi, { configPath });
+					pi.on("context_with_system", (event) => { sent = normalizeContext({ messages: convertToLlm(event.messages) }); });
+				},
+			});
+			try {
+				await f.session.prompt("A ".repeat(1000));
+				await f.session.prompt("B ".repeat(100));
+				// The fixture bills 20 total input (15 cached) and 4 output tokens.
+				const expected = (5 * 1 + 15 * 0.5 + 4 * 2) / 1e6 * 0.5;
+				const assistant: any = f.session.messages.filter((message) => message.role === "assistant").at(-1);
+				expect(assistant.usage.cost.total).toBeCloseTo(expected, 12);
+				const warmed = await f.runtime.streamSimple(f.session.model!, sent, { sessionId: f.manager.getSessionId(), maxTokens: 1, onPayload: () => undefined }).result();
+				expect(warmed.usage.cost.total).toBeCloseTo(expected, 12);
+				const result = await f.session.compact();
+				expect(result.usage?.cacheRead).toBe(15);
+				if (api === "openai-responses") {
+					expect((result.details as any).version).toBe(3);
+					expect((result.details as any).portableUsage.cost.total).toBeCloseTo(expected, 12);
+					expect((result.details as any).nativeUsage.cost.total).toBeCloseTo((20 * 1 + 4 * 2) / 1e6 * 0.5, 12);
+				} else expect(result.usage?.cost.total).toBeCloseTo(expected, 12);
+				await f.session.prompt("C after compaction");
+				const root = f.manager.getBranch().find((entry) => entry.type === "message" && entry.message.role === "user")!;
+				const tree = await f.session.navigateTree(root.id, { summarize: true });
+				expect(tree.cancelled).toBe(false);
+				const summary = f.manager.getBranch().find((entry) => entry.type === "branch_summary");
+				expect(summary?.type).toBe("branch_summary");
+				if (summary?.type === "branch_summary") expect(summary.usage?.cost.total).toBeCloseTo(expected, 12);
+				expect(f.errors).toEqual([]);
+				await f.session.reload();
+				await f.session.prompt("D after reload");
+				const reloaded: any = f.session.messages.filter((message) => message.role === "assistant").at(-1);
+				expect(reloaded.usage.cost.total).toBeCloseTo(expected, 12);
+				expect(f.errors).toEqual([]);
+			} finally { await f.close(); await rm(configDir, { recursive: true, force: true }); }
+		});
+	}
 });
 
 describe("cached portable summaries", () => {

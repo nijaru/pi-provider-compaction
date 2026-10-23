@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createAssistantMessageEventStream, InMemoryCredentialStore, normalizeContext, type Provider } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { decorateProvider, installObserver, leaseEffectiveProvider, STREAM_OBSERVER } from "../provider";
+import { bindUsageHeaders, decorateProvider, installObserver, leaseEffectiveProvider, STREAM_OBSERVER } from "../provider";
 import { NativeCompactionValidationError, requestProviderCompaction } from "../protocol";
 
 const model = { provider: "fixture", api: "openai-responses", id: "fixture" } as any;
@@ -193,6 +193,72 @@ test("effective-provider leases preserve dispatch and cleanup without registry r
 	expect(lease.isInstalled()).toBe(false);
 });
 
+test("pricing precedes terminal consumers and captured usage in both stream entrypoints", async () => {
+	const captured: number[] = [];
+	const dispatch = (_model: any, _context: any, options: any) => {
+		const source = createAssistantMessageEventStream();
+		void (async () => {
+			await options.onPayload?.({}, model);
+			const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), content: [], stopReason: "stop", usage: { ...nativeUsage, cost: { ...nativeUsage.cost, total: 1 } } };
+			source.push({ type: "done", reason: "stop", message });
+			source.end(message);
+		})();
+		return source;
+	};
+	const base = { id: "fixture", name: "Fixture", auth: {}, getModels: () => [model], stream: dispatch, streamSimple: dispatch } as Provider;
+	const capture = leaseEffectiveProvider(base, () => base, () => Object.assign((payload: unknown) => payload, { complete: (message: any) => captured.push(message.usage.cost.total) }))!;
+	const price = leaseEffectiveProvider(base, () => base, () => Object.assign((payload: unknown) => payload, { priceUsage: (message: any) => { message.usage.cost.total *= 2; } }))!;
+	try {
+		expect((await base.stream(model, context, {}).result()).usage.cost.total).toBe(2);
+		const stream = base.streamSimple(model, context, {});
+		for await (const event of stream) if (event.type === "done") expect(event.message.usage.cost.total).toBe(2);
+		expect(captured).toEqual([2, 2]);
+	} finally { price.remove(); capture.remove(); }
+});
+
+test("header identity scopes summary pricing without reading headers or crossing sessions", async () => {
+	const dispatch = () => {
+		const stream = createAssistantMessageEventStream();
+		const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), content: [], stopReason: "stop", usage: { ...nativeUsage, cost: { ...nativeUsage.cost, total: 1 } } };
+		queueMicrotask(() => { stream.push({ type: "done", reason: "stop", message }); stream.end(message); });
+		return stream;
+	};
+	const base = { id: "fixture", name: "Fixture", auth: {}, getModels: () => [model], stream: dispatch, streamSimple: dispatch } as Provider;
+	const acquire = (owner: string, multiplier: number) => leaseEffectiveProvider(base, () => base, (_model, _context, _options, scope) => Object.assign((payload: unknown) => payload, {
+		priceUsage: (message: any) => { if (scope.sessionId === owner) message.usage.cost.total *= multiplier; },
+	}))!;
+	const leases = [acquire("A", 2), acquire("B", 3)];
+	try {
+		const headers = new Proxy({}, { ownKeys() { throw new Error("Pricing must not inspect header content"); }, get() { throw new Error("Pricing must not inspect header content"); } });
+		bindUsageHeaders(headers, "A");
+		expect((await base.streamSimple(model, context, { sessionId: "B", headers }).result()).usage.cost.total).toBe(2);
+		expect((await base.streamSimple(model, context, { sessionId: "B" }).result()).usage.cost.total).toBe(3);
+		expect((await base.streamSimple(model, context, { sessionId: "unowned" }).result()).usage.cost.total).toBe(1);
+	} finally { for (const lease of leases) lease.remove(); }
+});
+
+for (const revoked of [false, true]) test(`in-flight pricing survives recomposition but not lease revocation (revoked=${revoked})`, async () => {
+	const source = createAssistantMessageEventStream();
+	const base = { id: "fixture", name: "Fixture", auth: {}, getModels: () => [model], stream: () => source, streamSimple: () => source } as Provider;
+	let current: Provider = base;
+	const lease = leaseEffectiveProvider(base, () => current, () => Object.assign((payload: unknown) => payload, { priceUsage: (message: any) => { message.usage.cost.total *= 2; } }))!;
+	const output = base.streamSimple(model, context, {});
+	if (revoked) lease.remove();
+	else current = { ...base };
+	const message: any = { role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), content: [], stopReason: "stop", usage: { ...nativeUsage, cost: { ...nativeUsage.cost, total: 1 } } };
+	source.push({ type: "done", reason: "stop", message }); source.end(message);
+	try { expect((await output.result()).usage.cost.total).toBe(revoked ? 1 : 2); }
+	finally { lease.remove(); }
+});
+
+test("a priced source ending without a terminal event resolves as an error", async () => {
+	const raw = { async *[Symbol.asyncIterator]() {}, result: () => new Promise(() => {}) } as any;
+	const base = { id: "fixture", name: "Fixture", auth: {}, getModels: () => [model], stream: () => raw, streamSimple: () => raw } as Provider;
+	const lease = leaseEffectiveProvider(base, () => base, () => Object.assign((payload: unknown) => payload, { priceUsage() {} }))!;
+	try { expect((await base.streamSimple(model, context, {}).result()).stopReason).toBe("error"); }
+	finally { lease.remove(); }
+});
+
 test("alternating shared-runtime leases stay bounded under Node", async () => {
 	const built = await Bun.build({ entrypoints: [join(import.meta.dir, "provider-leases.node.ts")], target: "node" });
 	expect(built.success).toBe(true);
@@ -292,6 +358,44 @@ test("effective reacquisition preserves external replacements and restores detac
 	expect(fourth.isInstalled()).toBe(true);
 	fourth.remove();
 	expect(Object.getOwnPropertyDescriptors(base)).toEqual(descriptors);
+});
+
+test("mixed native and models.json APIs each receive one pricing lease", async () => {
+	const directory = await mkdtemp(join(tmpdir(), "provider-mixed-api-"));
+	const rates = { input: 1, output: 0, cacheRead: 0, cacheWrite: 0 };
+	const nativeModel: any = { ...model, id: "native", api: "openai-completions", name: "Native", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: false, contextWindow: 10000, maxTokens: 100, cost: rates };
+	const dispatch = () => {
+		const stream = createAssistantMessageEventStream();
+		const message: any = { role: "assistant", api: nativeModel.api, provider: model.provider, model: nativeModel.id, timestamp: Date.now(), content: [], stopReason: "stop", usage: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0, totalTokens: 2, cost: { input: 1e-6, output: 0, cacheRead: 0, cacheWrite: 0, total: 1e-6 } } };
+		queueMicrotask(() => { stream.push({ type: "done", reason: "stop", message }); stream.end(message); });
+		return stream;
+	};
+	const base = { id: model.provider, name: "Fixture", auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => ({ auth: { apiKey: "fixture" }, source: "fixture" }) } },
+		getModels: () => [nativeModel], stream: dispatch, streamSimple: dispatch } as Provider;
+	const leases: ReturnType<typeof installObserver>[] = [];
+	try {
+		const modelsPath = join(directory, "models.json");
+		await writeFile(modelsPath, JSON.stringify({ providers: { fixture: { models: [{ id: "response-only", api: "openai-responses", contextWindow: 10000, maxTokens: 100, cost: rates }] } } }));
+		const runtime = await ModelRuntime.create({ credentials: new InMemoryCredentialStore(), modelsPath, modelsStorePath: join(directory, "catalog.json"), refreshOnCreate: false });
+		runtime.registerNativeProvider(base);
+		const registry = new ModelRegistry(runtime);
+		const pi = { registerProvider: registry.registerProvider.bind(registry) } as any;
+		for (const id of ["native", "response-only"]) {
+			const target = registry.find(model.provider, id)!;
+			const lease = installObserver(pi, { model: target, modelRegistry: registry }, () => Object.assign((payload: unknown) => payload, { priceUsage: (message: any) => { message.usage.cost.total *= 0.5; } }));
+			leases.push(lease);
+			expect(lease?.api).toBe(target.api);
+		}
+		const fetch = (async () => {
+			const response = { id: "fixture", status: "completed", output: [], usage: { input_tokens: 1, output_tokens: 1, total_tokens: 2 } };
+			return new Response(`data: ${JSON.stringify({ type: "response.created", response: { ...response, status: "in_progress" } })}\n\ndata: ${JSON.stringify({ type: "response.completed", response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
+		}) as unknown as typeof globalThis.fetch;
+		for (const id of ["native", "response-only"]) {
+			const reply = await runtime.streamSimple(registry.find(model.provider, id)!, context, { fetch }).result();
+			expect(reply.stopReason).toBe("stop");
+			expect(reply.usage.cost.total).toBeCloseTo(0.5e-6, 12);
+		}
+	} finally { for (const lease of leases) lease?.remove(); await rm(directory, { recursive: true, force: true }); }
 });
 
 for (const kind of ["native", "legacy"] as const) for (const releaseFirst of [0, 1]) test(`real Pi ${kind} registration shares one dispatcher (release first=${releaseFirst})`, async () => {
