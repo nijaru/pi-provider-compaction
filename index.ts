@@ -157,7 +157,7 @@ export default function (pi: ExtensionAPI): void {
 	// hook/privacy policy, even if the visible summary text happens to match.
 	// Older hosts in the native adapter's supported range lack getSettings.
 	// Keep their existing native path; cache preferences require that host API.
-	const configuration = () => typeof pi.getSettings === "function" ? cacheConfig(pi.getSettings()) : { cachedSummaries: false, outcomeNotifications: false, cacheRetention: undefined };
+	const configuration = () => typeof pi.getSettings === "function" ? cacheConfig(pi.getSettings()) : { cachedSummaries: false, cacheRetention: undefined };
 	const secret = randomBytes(32);
 	const routeDigest = (value: unknown) => createHmac("sha256", secret).update(JSON.stringify(value)).digest("hex");
 	let runtimeId = randomUUID();
@@ -493,9 +493,6 @@ export default function (pi: ExtensionAPI): void {
 		const recorded = isObject(event.compactionEntry.details) ? event.compactionEntry.details.providerCompaction : undefined;
 		const owned = isObject(recorded) && equal(recorded, lastOutcome);
 		if (!owned && !fallbackReason && readNativeCompactionDetails(event.compactionEntry.details)?.version !== 3) fallback("another handler supplied the committed result");
-		if (owned) {
-			if (configuration().outcomeNotifications && lastOutcome) context.ui.notify(`Compacted via ${lastOutcome.path} in ${(lastOutcome.elapsedMs / 1000).toFixed(1)}s${lastOutcome.usage ? `; cache read ${lastOutcome.usage.cacheRead}, write ${lastOutcome.usage.cacheWrite}; estimated cost $${lastOutcome.usage.cost.total.toFixed(6)}` : ""}`, "info");
-		}
 		// Only static diagnostics are persisted, never request/auth data or error text.
 		if (fallbackReason) pi.appendEntry("pi-provider-compaction:diagnostic", { status: `portable: ${fallbackReason}` });
 		active = undefined; snapshot = undefined; cache = undefined;

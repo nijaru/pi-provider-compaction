@@ -37,7 +37,7 @@ test("retained-boundary previews do not expose omitted thinking or tool argument
 	expect(instruction).not.toContain("private-argument");
 });
 test("cache preferences accept known retention tiers and reject unknown values", () => {
-	expect(cacheConfig({ providerCompaction: { cachedSummaries: false, cacheRetention: "long", outcomeNotifications: true } })).toEqual({ cachedSummaries: false, cacheRetention: "long", outcomeNotifications: true });
+	expect(cacheConfig({ providerCompaction: { cachedSummaries: false, cacheRetention: "long" } })).toEqual({ cachedSummaries: false, cacheRetention: "long" });
 	expect(cacheConfig({ providerCompaction: { cacheRetention: "made-up" } }).cacheRetention).toBeUndefined();
 });
 

@@ -39,15 +39,14 @@ The summary request extends the captured logical prompt, rather than serializing
 ```json
 {
   "providerCompaction": {
-    "cachedSummaries": true,
-    "outcomeNotifications": false
+    "cachedSummaries": true
   }
 }
 ```
 
 These are the defaults on hosts exposing Pi's `getSettings` API; older hosts retain native compaction with cached summaries disabled. Optional `cacheRetention` accepts `"short"`, `"long"`, or `"none"`; omission inherits Pi/provider behavior. Retention is applied per request, not through process-wide environment changes. A longer tier can increase cache-write charges and only works where the adapter/backend supports it.
 
-A cache hit is best effort, not a promised saving. Countdown estimates use the model's declared `promptCache` lifetime for the active tier, measured conservatively from request dispatch. Missing lifetimes remain unknown: DeepSeek, for example, [documents best-effort eviction over hours to days](https://api-docs.deepseek.com/guides/kv_cache/), not a predictable expiry. Pi's successful warmer requests refresh the observed cycle and countdown.
+A cache hit is best effort, not a promised saving. Expiry estimates use the model's declared `promptCache` lifetime for the active tier, measured conservatively from request dispatch. Missing lifetimes remain unknown: DeepSeek, for example, [documents best-effort eviction over hours to days](https://api-docs.deepseek.com/guides/kv_cache/), not a predictable expiry. Pi's successful warmer requests refresh the observed cycle and estimated expiry.
 
 With [pi-compactor's opt-in idle expiry policy](https://github.com/nijaru/pi-compactor#cache-aware-idle-compaction), compaction can run before an estimated expiry. Both extensions share a live ownership/input guard, checked before paid summary and native-checkpoint stages regardless of extension order. A failed or revoked cached-only attempt cancels instead of starting an ordinary summary. It does not start a continuation.
 
@@ -77,7 +76,7 @@ Legacy v1/v2 whole-history checkpoints remain inspectable but are never reinterp
 
 ## Diagnose portable fallback
 
-Committed compaction entries retain the selected path, elapsed time, reported usage, and estimated cost. Optional outcome notifications show those measurements, not hypothetical savings. Portable fallback appends a `pi-provider-compaction:diagnostic` session entry with a fixed reason. Cancelled attempts with reported usage retain that usage in the same diagnostic record; without a saved checkpoint, Pi's extension API cannot include it in compaction totals. Diagnostics stay out of model context and never include request content, credentials, or backend error text.
+Committed compaction entries retain the selected path, elapsed time, reported usage, and estimated cost. Portable fallback appends a `pi-provider-compaction:diagnostic` session entry with a fixed reason. Cancelled attempts with reported usage retain that usage in the same diagnostic record; without a saved checkpoint, Pi's extension API cannot include it in compaction totals. Diagnostics stay out of model context and never include request content, credentials, or backend error text.
 
 These records describe attempts made while the extension was loaded; they cannot explain earlier compactions retroactively. A committed native checkpoint does not by itself prove that a later request replayed it.
 

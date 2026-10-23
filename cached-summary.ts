@@ -17,13 +17,12 @@ export interface CacheState {
 	cachedTokens: number;
 	inputTokens: number;
 }
-export interface CacheConfig { cachedSummaries: boolean; cacheRetention?: CacheRetention; outcomeNotifications: boolean }
+export interface CacheConfig { cachedSummaries: boolean; cacheRetention?: CacheRetention }
 export function cacheConfig(settings: unknown): CacheConfig {
 	const raw = isObject(settings) && isObject(settings.providerCompaction) ? settings.providerCompaction : {};
 	return {
 		cachedSummaries: raw.cachedSummaries !== false,
 		cacheRetention: raw.cacheRetention === "long" || raw.cacheRetention === "short" || raw.cacheRetention === "none" ? raw.cacheRetention : undefined,
-		outcomeNotifications: raw.outcomeNotifications === true,
 	};
 }
 export function supportsCachedSummary(model: Model<any> | undefined): boolean {
