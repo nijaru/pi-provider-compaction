@@ -155,7 +155,7 @@ function observerLeases(provider: string, owned: () => boolean, restore: () => v
 type ObserverLeases = ReturnType<typeof observerLeases>;
 // Pi's uncached module loader can instantiate this extension separately for
 // sessions sharing one model runtime. Weak ownership must span those instances.
-const LEASE_TABLES = Symbol.for("@nijaru/pi-provider-compaction/observer-leases-v1");
+const LEASE_TABLES = Symbol.for("@nijaru/pi-provider-compaction/observer-leases-v2");
 interface LeaseTables {
 	effectiveLeases: WeakMap<Provider, { owned(): boolean; leases: ObserverLeases }>;
 	effectiveRestores: WeakMap<Function, { base: Provider; restore(): void }>;
