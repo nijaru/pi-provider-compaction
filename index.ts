@@ -112,6 +112,7 @@ function combineUsage(first: Usage | undefined, second: Usage | undefined): Usag
 	for (const key of ["input", "output", "cacheRead", "cacheWrite", "totalTokens"] as const) result[key] += second[key];
 	for (const key of ["reasoning", "cacheWrite1h"] as const) if (first[key] !== undefined || second[key] !== undefined) result[key] = (first[key] ?? 0) + (second[key] ?? 0);
 	for (const key of ["input", "output", "cacheRead", "cacheWrite", "total"] as const) result.cost[key] += second.cost[key];
+	result.cost.totalFromProvider = first.cost.totalFromProvider === true && second.cost.totalFromProvider === true;
 	return result;
 }
 

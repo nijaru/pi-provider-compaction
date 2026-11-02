@@ -97,6 +97,35 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 }
 
 describe("Pi runner + real Responses adapter", () => {
+	test.each([[true, true], [true, false], [false, true]] as const)("combined compaction cost retains provenance only when both parts are billed (%s, %s)", async (first, second) => {
+		const flags: boolean[] = [];
+		let priced = 0;
+		const f = await fixture({ hooks(pi) {
+			let lease: { remove(): void } | undefined;
+			pi.on("session_start", (_event, context) => {
+				pi.events.emit("pi-provider-compaction:observe-usage", {
+					context, model: context.model,
+					priceFor: () => (_timestamp: number, value: import("@earendil-works/pi-ai").Usage) => {
+						if (!flags.length) return;
+						value.cost.totalFromProvider = flags.shift()!;
+						value.cost.total = 0.25;
+						priced++;
+					},
+					respond(value: typeof lease) { lease = value; },
+				});
+			});
+			pi.on("session_shutdown", () => { lease?.remove(); });
+		} });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			flags.push(first, second);
+			const result = await f.session.compact();
+			expect(priced).toBe(2);
+			expect(result.usage?.cost).toMatchObject({ total: 0.5, totalFromProvider: first && second });
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
 	test.each([false, true])("SDK-scoped generic policy suppresses native requests in either extension order (companion first=%s)", async (hooksFirst) => {
 		let genericCompactions = 0;
 		const f = await fixture({

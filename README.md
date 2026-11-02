@@ -1,6 +1,6 @@
 # pi-provider-compaction
 
-Experimental cache-aware compaction for [Pi](https://github.com/earendil-works/pi), with portable summaries and optional provider-native checkpoints. Minimum runtime: Pi 0.87.0. Development checks target Pi 1.4.0.
+Experimental cache-aware compaction for [Pi](https://github.com/earendil-works/pi), with portable summaries and optional provider-native checkpoints. Minimum runtime: Pi 0.87.0. Development checks target Pi 1.5.0.
 
 **Experimental; qualified backend probes are not production validation.** Real runner/adapter fixtures and live DeepSeek, MiMo and Codex probes pass, with the preservation and cache-hit qualifications below. Broader backend and deployment validation remains incomplete.
 
@@ -101,7 +101,7 @@ pi --extension ./dist/index.js
 
 The manifest loads the built `dist/index.js`, including a bundled stateless Responses serializer validator; source or host dependency changes require a rebuild. `bun run check` rebuilds first and tests the artifact against Pi's actual host serializer, including function-call history replayed as grammar tools. Keep global installation disabled while testing. Publishing and global activation are separate approval steps.
 
-Tests include real Pi 1.4.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence and real idle-expiry transactions in both extension orders. Cached-summary fixtures also exercise built-in DeepSeek/Xiaomi dispatch, Anthropic Messages, late tool output, truncated-output fallback and measured usage. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration. `PI_PEAK_HOURS_FIXTURE_PATH` adds request-wide pricing checks in both extension orders, including warming, branch summaries, mixed-API dispatch and composition with `/fast`.
+Tests include real Pi 1.5.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence and real idle-expiry transactions in both extension orders. Cached-summary fixtures also exercise built-in DeepSeek/Xiaomi dispatch, Anthropic Messages, late tool output, truncated-output fallback and measured usage. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration. `PI_PEAK_HOURS_FIXTURE_PATH` adds request-wide pricing checks in both extension orders, including warming, branch summaries, mixed-API dispatch and composition with `/fast`.
 
 Authenticated cached-summary smoke tests use synthetic history, including a value beyond the ordinary tool-result excerpt, and check continuation:
 

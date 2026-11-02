@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
-import { normalizeContext, Type, type Model, type Tool, type ProviderStreams } from "@earendil-works/pi-ai";
+import { normalizeContext, type Model, type Tool, type ProviderStreams } from "@earendil-works/pi-ai";
+import { Type } from "typebox";
 import * as direct from "@earendil-works/pi-ai/api/openai-responses";
 import * as azure from "@earendil-works/pi-ai/api/azure-openai-responses";
 import * as codex from "@earendil-works/pi-ai/api/openai-codex-responses";
