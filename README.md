@@ -96,10 +96,10 @@ An empty `models` list is not an override. When `pi-compactor` is loaded, its ef
 bun install
 bun run check
 bun run build
-pi --extension ./dist/index.js
+pi --extension ./dist/index.ts
 ```
 
-The manifest loads the built `dist/index.js`, including a bundled stateless Responses serializer validator; source or host dependency changes require a rebuild. `bun run check` rebuilds first and tests the artifact against Pi's actual host serializer, including function-call history replayed as grammar tools. Keep global installation disabled while testing. Publishing and global activation are separate approval steps.
+The manifest loads the built `dist/index.ts`, including a bundled stateless Responses serializer validator; source or host dependency changes require a rebuild. The `.ts` entry keeps Pi's host-module mapping active, avoiding duplicate Pi imports from local development dependencies. `bun run check` rebuilds first and tests the artifact against Pi's actual host serializer, including function-call history replayed as grammar tools. Keep global installation disabled while testing. Publishing and global activation are separate approval steps.
 
 Tests include real Pi 1.5.0 runner/adapter fixtures for all three protocols, repeated prefix compaction, transformed suffix preservation, unchanged fallback, grammar tools, strict defaults, tool IDs, images, prompt updates, cross-model thinking and mid-conversation effort changes. Set `PI_COMPACTOR_FIXTURE_PATH` to a `pi-compactor` entrypoint to check SDK flag precedence and real idle-expiry transactions in both extension orders. Cached-summary fixtures also exercise built-in DeepSeek/Xiaomi dispatch, Anthropic Messages, late tool output, truncated-output fallback and measured usage. The optional installed-fast-mode fixture (`PI_FAST_MODE_FIXTURE_PATH`) checks actual `pi-fast-mode` composition across `/reload`; it creates an isolated fast-mode configuration. `PI_PEAK_HOURS_FIXTURE_PATH` adds request-wide pricing checks in both extension orders, including warming, branch summaries, mixed-API dispatch and composition with `/fast`.
 
