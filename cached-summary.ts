@@ -55,8 +55,14 @@ function cacheNeutral(payload: JsonObject): JsonObject {
 	};
 	if (Array.isArray(result.system)) result.system = result.system.map(block);
 	if (Array.isArray(result.tools)) result.tools = result.tools.map(block);
-	for (const key of ["messages", "input"]) if (Array.isArray(result[key])) result[key] = (result[key] as unknown[]).map((message) =>
-		isObject(message) && Array.isArray(message.content) ? { ...message, content: message.content.map(block) } : message);
+	for (const key of ["messages", "input"]) if (Array.isArray(result[key])) result[key] = (result[key] as unknown[]).map((message) => {
+		if (!isObject(message)) return message;
+		// Anthropic may expand a string to text blocks only when adding a cache
+		// marker. Both forms carry the same text when that marker moves later.
+		const content = key === "messages" && typeof message.content === "string"
+			? [{ type: "text", text: message.content }] : message.content;
+		return Array.isArray(content) ? { ...message, content: content.map(block) } : message;
+	});
 	return result;
 }
 export function sameCachedPrompt(left: JsonObject, right: unknown): boolean {
@@ -93,7 +99,8 @@ export function summaryPayload(captured: JsonObject, candidate: unknown): JsonOb
 		const old = original[index], normalized = prefix[index], extended = next[index];
 		if (index >= 0 && !equal(normalized, extended) && isObject(old) && isObject(normalized) && isObject(extended)) {
 			// Preserve the captured coalesced user block, including its cache markers.
-			items = [...original.slice(0, index), { ...old, content: [...old.content as unknown[], ...(extended.content as unknown[]).slice((normalized.content as unknown[]).length)] }, ...next.slice(prefix.length)];
+			const content = Array.isArray(old.content) ? old.content : [{ type: "text", text: old.content }];
+			items = [...original.slice(0, index), { ...old, content: [...content, ...(extended.content as unknown[]).slice((normalized.content as unknown[]).length)] }, ...next.slice(prefix.length)];
 		} else items = [...original, ...next.slice(prefix.length)];
 	} else {
 		// Responses appends request-only effort at the tail. Keep that original
@@ -211,6 +218,9 @@ export async function cachedSummary(request: CachedRequest, context: ExtensionCo
 	try {
 		const response = await request.provider.streamSimple(request.model, normalizeContext({ messages: [...request.context.messages, { role: "user", content: summaryInstruction(request, boundary, instructions), timestamp: Date.now() }] }), {
 			...request.options, signal, maxRetries: 0,
+			// Reuse the prompt cache, never the foreground conversation's mutable
+			// continuation state, including when this summary is later discarded.
+			disableContinuation: true,
 			// reserveTokens is a compaction trigger, not a summary budget. Let the
 			// adapter use its model output limit and context clamp, as Pi does; do
 			// not inherit a one-token cache-warmer or caller-specific output cap.

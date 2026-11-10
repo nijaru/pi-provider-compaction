@@ -18,6 +18,12 @@ test("cache-control movement may extend a coalesced Anthropic user block without
 	expect((result.messages as any)[0].content[1]).toEqual({ type: "text", text: "summary instruction" });
 	expect(() => summaryPayload(captured, { ...candidate, system: [{ type: "text", text: "changed policy" }] })).toThrow();
 });
+test("Anthropic string content can extend into text blocks without losing the original text", () => {
+	const captured = { messages: [{ role: "user", content: "history" }] };
+	const candidate = { messages: [{ role: "user", content: [{ type: "text", text: "history" }, { type: "text", text: "summary instruction", cache_control: { type: "ephemeral" } }] }] };
+	expect(summaryPayload(captured, candidate)).toEqual({ messages: [{ role: "user", content: [{ type: "text", text: "history" }, { type: "text", text: "summary instruction" }] }] });
+	expect(() => summaryPayload(captured, { messages: [{ role: "user", content: [{ type: "text", text: "changed history" }, { type: "text", text: "summary instruction" }] }] })).toThrow("summary prefix differs");
+});
 test("expiry is a declared best-effort TTL from request start; unknown remains unknown", () => {
 	const request = { model: { id: "m", provider: "p", promptCache: { short: 300 } }, options: { cacheRetention: "short" }, startedAt: Date.now() - 60_000, cycle: "one" } as CachedRequest;
 	const message = { model: "m", provider: "p", stopReason: "stop", usage } as any;
