@@ -1,12 +1,12 @@
 import { createHash, createHmac, randomBytes, randomUUID } from "node:crypto";
 import type { AgentMessage } from "@earendil-works/pi-agent-core";
-import { normalizeContext, registerSessionResourceCleanup, type Model, type Provider, type ProviderHeaders, type ProviderStreamOptions, type SimpleStreamOptions, type TranscriptContext, type Usage } from "@earendil-works/pi-ai";
+import { normalizeContext, registerSessionResourceCleanup, type Model, type ProviderHeaders, type ProviderStreamOptions, type SimpleStreamOptions, type TranscriptContext, type Usage } from "@earendil-works/pi-ai";
 import { compact, convertToLlm, type ExtensionAPI, type ExtensionContext, type SessionEntry } from "@earendil-works/pi-coding-agent";
-import { resolveCompactionModelPolicy } from "./policy";
-import { cacheConfig, cachedSummary, captureCachedRequest, finishCachedRequest, requestCacheState, sameCachedPrompt, supportsCachedSummary, withFileTracking, type CachedRequest } from "./cached-summary";
+import { compactionModelReason, resolveCompactionModelPolicy } from "./policy";
+import { cacheConfig, cachedSummary, captureCachedRequest, finishCachedRequest, requestCacheState, sameCachedPrompt, supportsCachedSummary, withFileTracking, type CachedRequest, type RequestIdentity } from "./cached-summary";
 import { bindUsageHeaders, installObserver, type InstalledObserver, type ObserveRequest } from "./provider";
 import { serveUsageObservers } from "./usage-observer";
-import { capturePreparedRequest, equal, requestPolicy, selectCoveredPrefix, substituteSummary, summarySlot, type PreparedRequest } from "./replay";
+import { capturePreparedRequest, equal, requestPolicy, selectCoveredPrefix, substituteSummary, summarySlot, type CaptureRejection, type PreparedRequest } from "./replay";
 import { isObject, NativeCompactionValidationError, requestProviderCompaction, resolveNativeProtocol, supportsResponsesApi, validateCompactedOutput, type NativeProtocol, type ResponseItem } from "./protocol";
 
 export const NATIVE_COMPACTION_TYPE = "pi-provider-compaction/openai-responses";
@@ -123,17 +123,17 @@ function supportedRouteOptions(model: Model<any>, options: ProviderStreamOptions
 	return !["AZURE_OPENAI_BASE_URL", "AZURE_OPENAI_RESOURCE_NAME", "AZURE_OPENAI_API_VERSION", "AZURE_OPENAI_DEPLOYMENT_NAME_MAP"].some((key) => process.env[key] !== undefined && options.env?.[key] === undefined);
 }
 
-interface Captured {
+interface Captured extends RequestIdentity {
 	prepared: PreparedRequest;
-	model: Model<any>;
-	provider: Provider;
 	options: (ProviderStreamOptions | SimpleStreamOptions) & { serviceTier?: string };
-	branchLength: number;
-	branchHash: string;
 	routeHash: string;
-	authHash: string;
 	policyHash: string;
-	sessionId: string;
+}
+/** Native and cached eligibility are independent, but share one publication lifetime. */
+interface Observation {
+	native?: Captured;
+	cached?: CachedRequest;
+	nativeRejection?: CaptureRejection;
 }
 interface Active {
 	entryId: string;
@@ -164,8 +164,7 @@ export default function (pi: ExtensionAPI): void {
 	let runtimeId = randomUUID();
 	let ctx: ExtensionContext | undefined;
 	let usageObservers = serveUsageObservers(pi, () => ctx);
-	let snapshot: Captured | undefined;
-	let cache: CachedRequest | undefined;
+	let observation: Observation | undefined;
 	let compactionRequest = false;
 	let expiryAttempt: ExpiryAttempt | undefined;
 	let lastOutcome: { path: string; elapsedMs: number; usage?: Usage; reason?: string } | undefined;
@@ -177,7 +176,7 @@ export default function (pi: ExtensionAPI): void {
 	let requestSequence = 0;
 	let fallbackReason: string | undefined;
 	const fallback = (reason: string) => { fallbackReason = reason; };
-	const invalidate = () => { generation++; runtimeId = randomUUID(); snapshot = undefined; cache = undefined; active = undefined; pending = undefined; expiryAttempt = undefined; };
+	const invalidate = () => { generation++; runtimeId = randomUUID(); observation = undefined; active = undefined; pending = undefined; expiryAttempt = undefined; };
 	const retire = () => {
 		usageObservers.clear();
 		invalidate();
@@ -193,16 +192,17 @@ export default function (pi: ExtensionAPI): void {
 		// between auxiliary calls that have no before_agent_start boundary.
 		usageObservers.ready(context);
 	});
-	const generic = (context: ExtensionContext) => resolveCompactionModelPolicy(pi, context).hasSelectors;
+	const genericReason = (context: ExtensionContext) => compactionModelReason(resolveCompactionModelPolicy(pi, context));
 	const route = (model: Model<any>, options: ProviderStreamOptions | SimpleStreamOptions) => routeDigest({ model, apiKey: options.apiKey, headers: options.headers, env: options.env });
 	const unchanged = (branch: readonly SessionEntry[], length: number, hash: string) => branch.length >= length && digest(branch.slice(0, length)) === hash && !branch.slice(length).some((entry) => entry.type === "context_edit");
 
 	const cacheState = (context: ExtensionContext) => {
+		const cache = observation?.cached;
 		let reason: string | undefined;
 		if (!configuration().cachedSummaries) reason = "cached summaries disabled";
-		else if (generic(context)) reason = "explicit compaction model takes precedence";
-		else if (cache && !observer?.isInstalled()) reason = "request observer no longer owned";
-		else if (cache && (cache.sessionId !== context.sessionManager.getSessionId() || context.model?.id !== cache.model.id || context.model?.provider !== cache.model.provider || context.model?.api !== cache.model.api || context.modelRegistry.getProvider(cache.model.provider) !== cache.provider || !unchanged(context.sessionManager.getBranch(), cache.branchLength, cache.branchHash))) reason = "cache snapshot no longer matches session/model/history";
+		else reason = genericReason(context);
+		if (!reason && cache && !observer?.isInstalled()) reason = "request observer no longer owned";
+		else if (!reason && cache && (cache.sessionId !== context.sessionManager.getSessionId() || context.model?.id !== cache.model.id || context.model?.provider !== cache.model.provider || context.model?.api !== cache.model.api || context.modelRegistry.getProvider(cache.model.provider) !== cache.provider || !unchanged(context.sessionManager.getBranch(), cache.branchLength, cache.branchHash))) reason = "cache snapshot no longer matches session/model/history";
 		return requestCacheState(cache, reason);
 	};
 	const removeCacheState = pi.events.on("pi-provider-compaction:cache-state", (request) => {
@@ -250,7 +250,7 @@ export default function (pi: ExtensionAPI): void {
 		if (options.sessionId !== manager.getSessionId()) return;
 		if (compactionRequest) return;
 		if (!supportsNativeCompaction(model) && !supportsCachedSummary(model)) return;
-		if (!options.onPayload || generic(owner)) return;
+		if (!options.onPayload || genericReason(owner)) return;
 		// The Azure adapter also accepts API-specific overrides and process-env
 		// fallbacks. Those must not silently select a route absent from our evidence.
 		if (!supportedRouteOptions(model, options)) return;
@@ -260,6 +260,7 @@ export default function (pi: ExtensionAPI): void {
 		const config = configuration();
 		const effectiveOptions = { ...options, ...(config.cacheRetention === undefined ? {} : { cacheRetention: config.cacheRetention }) };
 		let candidate: CachedRequest | undefined;
+		let observed: Observation | undefined;
 		const branch = manager.getBranch();
 		const branchHash = digest(branch);
 		const canonical = transcript(manager.buildSessionProjection().messages);
@@ -270,30 +271,34 @@ export default function (pi: ExtensionAPI): void {
 		};
 		const handler = async (payload: unknown) => {
 			if (!current()) return payload;
-			snapshot = undefined;
+			const evidence: Observation = { cached: observation?.cached };
+			observed = evidence;
+			observation = evidence;
+			candidate = undefined;
 			const auth = await owner.modelRegistry.getApiKeyAndHeaders(model);
-			if (!current()) return payload;
+			if (!current() || observation !== evidence) return payload;
 			// A registry lookup after payload hooks must describe the credentials used by
 			// THIS request, not a newly rotated account. Header/env rewrites without an
 			// exact auth correspondence are deliberately ineligible.
 			const normalizedHeaders = (headers: ProviderHeaders | undefined) => Object.entries(headers ?? {}).map(([name, value]) => [name.toLowerCase(), value]).sort(([a], [b]) => String(a).localeCompare(String(b)));
-			if (!auth.ok || generic(owner) || auth.apiKey !== options.apiKey || (auth.baseUrl ?? model.baseUrl) !== model.baseUrl || !equal(normalizedHeaders(auth.headers), normalizedHeaders(options.headers)) || !equal(auth.env ?? {}, options.env ?? {})) {
-				active = undefined; cache = undefined;
+			if (!auth.ok || genericReason(owner) || auth.apiKey !== options.apiKey || (auth.baseUrl ?? model.baseUrl) !== model.baseUrl || !equal(normalizedHeaders(auth.headers), normalizedHeaders(options.headers)) || !equal(auth.env ?? {}, options.env ?? {})) {
+				active = undefined; evidence.cached = undefined;
 				return payload;
 			}
 			const provider = owner.modelRegistry.getProvider(model.provider);
 			if (!provider) return payload;
 			const routeHash = route(model, options);
+			const identity: RequestIdentity = { model, provider, sessionId: manager.getSessionId(), branchLength: branch.length, branchHash, authHash: routeDigest(auth) };
 			if (config.cachedSummaries && supportsCachedSummary(model)) {
-				const warming = options.maxTokens === 1 && cache && cache.authHash === routeDigest(auth) && sameCachedPrompt(cache.payload, payload) && equal(cache.context, context);
+				const cache = evidence.cached;
+				const warming = options.maxTokens === 1 && cache && cache.authHash === identity.authHash && sameCachedPrompt(cache.payload, payload) && equal(cache.context, context);
 				candidate = warming ? { ...cache!, startedAt, cycle: randomUUID(), usage: undefined, expiresAt: undefined } : captureCachedRequest({
-					model, provider, context, canonical, options: effectiveOptions, startedAt,
-					sessionId: manager.getSessionId(), branchLength: branch.length, branchHash, authHash: routeDigest(auth),
+					...identity, context, canonical, options: effectiveOptions, startedAt,
 				}, payload);
-				if (!warming) cache = undefined;
+				if (!warming) evidence.cached = undefined;
 			}
 			if (!supportsNativeCompaction(model)) return payload;
-			const prepared = capturePreparedRequest(model, context, canonical, payload);
+			const prepared = capturePreparedRequest(model, context, canonical, payload, (reason) => { evidence.nativeRejection = reason; });
 			if (!prepared) { active = undefined; return payload; }
 			const policyHash = digest(requestPolicy(model, prepared));
 			const latest = latestCompaction(branch);
@@ -312,24 +317,22 @@ export default function (pi: ExtensionAPI): void {
 						prepared.payload = structuredClone(replaced);
 						prepared.replacement = { index: slot, count: details.output.length };
 						// The actual request contains opaque state, not the captured readable prefix.
-						candidate = undefined; cache = undefined;
+						candidate = undefined; evidence.cached = undefined;
 					} else active = undefined;
 				} else active = undefined;
 			} else active = undefined;
-			snapshot = {
-				prepared, model: structuredClone(model), provider,
+			evidence.native = {
+				...identity, prepared, model: structuredClone(model), routeHash, policyHash,
 				options: { apiKey: options.apiKey, headers: structuredClone(options.headers), env: structuredClone(options.env), fetch: options.fetch, ...(typeof (options as { serviceTier?: unknown }).serviceTier === "string" ? { serviceTier: (options as { serviceTier: string }).serviceTier } : {}) },
-				branchLength: branch.length, branchHash, routeHash, authHash: routeDigest(auth), policyHash,
-				sessionId: owner.sessionManager.getSessionId(),
 			};
 			return result;
 		};
 		return Object.assign(handler, {
 			cacheRetention: config.cacheRetention,
 			complete: (message: Parameters<typeof finishCachedRequest>[1]) => {
-				if (!candidate || sequence !== requestSequence || !current()) return;
+				if (!candidate || !observed || observation !== observed || !current()) return;
 				finishCachedRequest(candidate, message);
-				if (candidate.usage) cache = candidate;
+				if (candidate.usage) observed.cached = candidate;
 			},
 		});
 	};
@@ -368,11 +371,11 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_before_compact", async (event, context) => {
 		const began = Date.now(), ticket = generation;
 		const sessionId = context.sessionManager.getSessionId();
-		fallbackReason = undefined;
+		fallbackReason = observation?.nativeRejection;
 		const attempt = expiryAttempt;
-		const capture = snapshot;
-		const cached = cacheState(context).available ? cache : undefined;
-		snapshot = undefined; cache = undefined; pending = undefined;
+		const capture = observation?.native;
+		const cached = cacheState(context).available ? observation?.cached : undefined;
+		observation = undefined; pending = undefined;
 		const cancelled = (usage?: Usage, reason = "compaction ownership or input changed") => {
 			// A cancelled attempt has no checkpoint to carry its known bill. Retain
 			// that usage in the existing session diagnostic, not a command-only cache.
@@ -393,12 +396,16 @@ export default function (pi: ExtensionAPI): void {
 			if (event.reason !== "manual" || !attempt.isCurrent() || !cached || cached.cycle !== attempt.cycle || attempt.signal && attempt.signal !== event.signal) return reject("idle transaction no longer authorized");
 			attempt.signal = event.signal;
 		}
-		if ((!capture && !cached) || !context.model || generic(context) || event.signal.aborted) return reject("no eligible snapshot, explicit model override, or aborted attempt");
+		if (!context.model) return reject("no active model");
+		const selection = genericReason(context);
+		if (selection) return reject(selection);
+		if (event.signal.aborted) return reject("compaction aborted");
+		if (!capture && !cached) return reject(fallbackReason ?? "no eligible snapshot");
 		const branch = context.sessionManager.getBranch();
 		const branchHash = digest(branch);
 		const source = cached ?? capture!;
 		if (context.sessionManager.getSessionId() !== source.sessionId || !equal(branch, event.branchEntries) || !unchanged(branch, source.branchLength, source.branchHash)) return reject("history/session changed since capture");
-		const current = () => ticket === generation && !event.signal.aborted && (!attempt || attempt.isCurrent()) && supportedRouteOptions(source.model, source.options) && !generic(context) &&
+		const current = () => ticket === generation && !event.signal.aborted && (!attempt || attempt.isCurrent()) && supportedRouteOptions(source.model, source.options) && !genericReason(context) &&
 			context.model?.id === source.model.id && context.model?.provider === source.model.provider && context.model?.api === source.model.api &&
 			observer?.isInstalled() === true && context.modelRegistry.getProvider(source.model.provider) === source.provider && unchanged(context.sessionManager.getBranch(), branch.length, branchHash);
 		const auth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
@@ -446,7 +453,7 @@ export default function (pi: ExtensionAPI): void {
 			return { compaction: result! };
 		};
 		if (!capture || !protocol || !input) {
-			return outcome(summaryPath, portable, summaryReason);
+			return outcome(summaryPath, portable, summaryReason ?? fallbackReason);
 		}
 		try {
 			const freshAuth = await context.modelRegistry.getApiKeyAndHeaders(context.model);
@@ -496,7 +503,7 @@ export default function (pi: ExtensionAPI): void {
 		if (!owned && !fallbackReason && readNativeCompactionDetails(event.compactionEntry.details)?.version !== 3) fallback("another handler supplied the committed result");
 		// Only static diagnostics are persisted, never request/auth data or error text.
 		if (fallbackReason) pi.appendEntry("pi-provider-compaction:diagnostic", { status: `portable: ${fallbackReason}` });
-		active = undefined; snapshot = undefined; cache = undefined;
+		active = undefined; observation = undefined;
 		const candidate = pending; pending = undefined;
 		if (!candidate || !equal(event.compactionEntry.details, candidate.details) || event.compactionEntry.summary !== candidate.summary) return;
 		const branch = context.sessionManager.getBranch();
@@ -513,5 +520,5 @@ export default function (pi: ExtensionAPI): void {
 			...(typeof candidate.capture.prepared.payload.model === "string" ? { payloadModel: candidate.capture.prepared.payload.model } : {}),
 		};
 	});
-	pi.on("session_compact_failed", () => { pending = undefined; snapshot = undefined; cache = undefined; });
+	pi.on("session_compact_failed", () => { pending = undefined; observation = undefined; });
 }

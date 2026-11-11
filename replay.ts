@@ -47,9 +47,11 @@ export interface PreparedRequest {
 	createdAt: number;
 }
 
+export type CaptureRejection = "unsupported payload shape" | "stateful request" | "snapshot exceeds size limit" | "prepared input differs from serializer";
+
 export function capturePreparedRequest(
 	model: Model<any>, context: TranscriptContext, canonical: TranscriptContext, payload: unknown,
-	reject: (reason: string) => void = () => {},
+	reject: (reason: CaptureRejection) => void = () => {},
 ): PreparedRequest | undefined {
 	if (!isObject(payload) || !Array.isArray(payload.input) || !payload.input.every(isObject)) { reject("unsupported payload shape"); return; }
 	// Reject stateful provider requests: coverage must be the complete visible input.

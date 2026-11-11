@@ -80,6 +80,8 @@ Legacy v1/v2 whole-history checkpoints remain inspectable but are never reinterp
 
 Committed compaction entries retain the selected path, elapsed time, reported usage, and estimated cost. Portable fallback appends a `pi-provider-compaction:diagnostic` session entry with a fixed reason. Cancelled attempts with reported usage retain that usage in the same diagnostic record; without a saved checkpoint, Pi's extension API cannot include it in compaction totals. Diagnostics stay out of model context and never include request content, credentials, or backend error text.
 
+Capture rejection reasons distinguish unsupported payloads, stateful requests, size limits, and prepared input that differs from the bundled serializer. They describe the current request, not a rejection from an earlier capture.
+
 These records describe attempts made while the extension was loaded; they cannot explain earlier compactions retroactively. A committed native checkpoint does not by itself prove that a later request replayed it.
 
 ## Generic compaction-model override
@@ -90,7 +92,7 @@ An explicit generic model takes precedence, matching `pi-compactor`:
 2. trusted `.pi/compaction-policy.json`;
 3. agent `compaction-policy.json`.
 
-An empty `models` list is not an override. When `pi-compactor` is loaded, its effective selection takes precedence, including flags injected by an SDK host rather than passed on the command line.
+An empty `models` list is not an override. When `pi-compactor` is loaded, its effective selection takes precedence, including flags injected by an SDK host rather than passed on the command line. Without it, this extension still honors the CLI and file overrides above. Suppression diagnostics identify the policy source without exposing model selectors.
 
 ## Local development
 

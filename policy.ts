@@ -28,11 +28,21 @@ type PolicyContext = Pick<ExtensionContext, "cwd" | "isProjectTrusted"> & {
 
 export type CompactionModelSource = "compactor" | "flag" | "project-policy" | "agent-policy";
 
-export interface CompactionModelPolicy {
-	/** True when a generic compaction model takes precedence over native compaction. */
-	hasSelectors: boolean;
-	/** Where the selectors were resolved from, for diagnostics. */
-	source?: CompactionModelSource;
+export type CompactionModelPolicy = { hasSelectors: false } | {
+	hasSelectors: true;
+	source: CompactionModelSource;
+};
+
+/** Fixed diagnostics identify the policy owner, never its private model selectors. */
+export function compactionModelReason(policy: CompactionModelPolicy): string | undefined {
+	if (!policy.hasSelectors) return;
+	const source = {
+		compactor: "pi-compactor",
+		flag: "--compaction-model",
+		"project-policy": "trusted project compaction-policy.json",
+		"agent-policy": "agent compaction-policy.json",
+	}[policy.source];
+	return `explicit compaction model takes precedence (${source})`;
 }
 
 function normalizeSelector(value: unknown): string | undefined {

@@ -37,7 +37,7 @@ function context(trusted = true): PolicyContext {
 function checkPolicy(argv: string[], expected: CompactionModelPolicy, ctx = context()) {
 	expect(resolveCompactionModelPolicy({ events: { emit() {} } }, ctx, argv)).toEqual(expected);
 }
-const none = { hasSelectors: false };
+const none = { hasSelectors: false } as const;
 const agent = { hasSelectors: true, source: "agent-policy" } as const;
 const project = { hasSelectors: true, source: "project-policy" } as const;
 const flag = { hasSelectors: true, source: "flag" } as const;

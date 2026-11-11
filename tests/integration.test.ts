@@ -154,6 +154,31 @@ describe("Pi runner + real Responses adapter", () => {
 		} finally { await f.close(); }
 	});
 
+	test("standalone policy suppression identifies its source without exposing selectors", async () => {
+		const previous = process.env.PI_COMPACTOR_AGENT_DIR;
+		let query: (() => any) | undefined;
+		const f = await fixture({ hooks(pi) { pi.on("agent_settled", (_event, context) => {
+			query = () => { let state: any; pi.events.emit("pi-provider-compaction:cache-state", { context, respond: (value: any) => { state = value; } }); return state; };
+		}); } });
+		try {
+			process.env.PI_COMPACTOR_AGENT_DIR = f.manager.getCwd();
+			await writeFile(join(f.manager.getCwd(), "compaction-policy.json"), JSON.stringify({ models: ["PRIVATE_SELECTOR"] }));
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const reason = "explicit compaction model takes precedence (agent compaction-policy.json)";
+			expect(query!()).toMatchObject({ available: false, reason });
+			await f.session.compact();
+			const diagnostics = f.manager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic");
+			expect(diagnostics.at(-1)).toMatchObject({ data: { status: `portable: ${reason}` } });
+			expect(JSON.stringify(diagnostics)).not.toContain("PRIVATE_SELECTOR");
+			expect(f.requests.some((request) => request.url.endsWith("/compact"))).toBe(false);
+			expect(f.errors).toEqual([]);
+		} finally {
+			if (previous === undefined) delete process.env.PI_COMPACTOR_AGENT_DIR;
+			else process.env.PI_COMPACTOR_AGENT_DIR = previous;
+			await f.close();
+		}
+	});
 	test.each([false, true])("bare SDK disposal retires the observer before another session uses the runtime (legacy=%s)", async (legacy) => {
 		const f = await fixture({ legacy });
 		try {
@@ -405,6 +430,46 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(f.requests.some((request) => new URL(request.url).pathname.endsWith("/compact"))).toBe(false);
 			expect((result.details as any).type).toBeUndefined();
 			expect(f.manager.getBranch().reverse().find((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toMatchObject({ data: { status: "portable: projected prefix differs from request context" } });
+		} finally { await f.close(); }
+	});
+	test.each([false, true])("serializer drift reports a fixed content-free native rejection (cached=%s)", async (cached) => {
+		const secret = "WIRE_ONLY_PRIVATE_POLICY";
+		const f = await fixture({ cached, hooks(pi) {
+			pi.on("before_provider_request", (event) => {
+				const payload = event.payload as any;
+				return { ...payload, input: payload.input.map((item: any, index: number) => index === 0 ? { ...item, content: [{ type: "input_text", text: secret }] } : item) };
+			});
+		} });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const before = f.requests.length;
+			const result = await f.session.compact();
+			expect(f.requests.slice(before).some((request) => request.url.endsWith("/compact"))).toBe(false);
+			if (cached) expect((result.details as any).providerCompaction.path).toBe("standard");
+			const diagnostics = f.manager.getBranch().filter((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic");
+			expect(diagnostics.at(-1)).toMatchObject({ data: { status: "portable: prepared input differs from serializer" } });
+			expect(JSON.stringify(diagnostics)).not.toContain(secret);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+	test("a later valid request does not inherit a serializer rejection", async () => {
+		let rewrite = true;
+		const f = await fixture({ hooks(pi) {
+			pi.on("before_provider_request", (event) => {
+				if (!rewrite) return;
+				const payload = event.payload as any;
+				return { ...payload, input: [...payload.input, { role: "user", content: "request-only rewrite" }] };
+			});
+		} });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			rewrite = false;
+			await f.session.prompt("B ".repeat(100));
+			const result = await f.session.compact();
+			expect((result.details as any).providerCompaction.path).toBe("standard + native");
+			expect(f.manager.getBranch().some((entry) => entry.type === "custom" && entry.customType === "pi-provider-compaction:diagnostic")).toBe(false);
+			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});
 	for (const change of ["payload", "policy", "history", "invalidate"] as const) test(`${change} change returns the untouched portable request`, async () => {
@@ -769,6 +834,33 @@ describe("cached portable summaries", () => {
 			expect((result.details as any).providerCompaction.path).toBe("cached");
 			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
+	});
+	test("a late warmer cannot republish evidence consumed by compaction", async () => {
+		let context: any, sent: any, bus: any;
+		let entered!: () => void, release!: () => void;
+		const started = new Promise<void>((resolve) => { entered = resolve; });
+		const released = new Promise<void>((resolve) => { release = resolve; });
+		const f = await fixture({ cached: true, cacheTtl: 300, builtin: "deepseek", api: "openai-completions", hooks(pi) {
+			bus = pi.events;
+			pi.on("context_with_system", (event) => { sent = normalizeContext({ messages: convertToLlm(event.messages) }); });
+			pi.on("agent_settled", (_event, ctx) => { context = ctx; });
+		}, async beforeReply(body) {
+			if ((body.max_completion_tokens ?? body.max_tokens) === 1) { entered(); await released; }
+		} });
+		const query = () => { let state: any; bus.emit("pi-provider-compaction:cache-state", { context, respond: (value: any) => { state = value; } }); return state; };
+		let warmer: Promise<unknown> | undefined;
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			warmer = f.runtime.streamSimple(f.session.model!, sent, { sessionId: f.manager.getSessionId(), maxTokens: 1, onPayload: () => undefined }).result();
+			await started;
+			await f.session.compact();
+			expect(query().available).toBe(false);
+			release();
+			await warmer;
+			expect(query().available).toBe(false);
+			expect(f.errors).toEqual([]);
+		} finally { release(); await warmer; await f.close(); }
 	});
 	test("unknown cache lifetime remains unknown but manual cached summarization is available", async () => {
 		let query: (() => any) | undefined;

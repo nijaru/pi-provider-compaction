@@ -28,18 +28,20 @@ export function cacheConfig(settings: unknown): CacheConfig {
 export function supportsCachedSummary(model: Model<any> | undefined): boolean {
 	return !!model && ["openai-completions", "openai-responses", "azure-openai-responses", "openai-codex-responses", "anthropic-messages"].includes(model.api);
 }
-export interface CachedRequest {
+export interface RequestIdentity {
 	model: Model<any>;
 	provider: Provider;
+	sessionId: string;
+	branchLength: number;
+	branchHash: string;
+	authHash: string;
+}
+export interface CachedRequest extends RequestIdentity {
 	context: TranscriptContext;
 	canonical: TranscriptContext;
 	payload: JsonObject;
 	options: SimpleStreamOptions;
 	startedAt: number;
-	sessionId: string;
-	branchLength: number;
-	branchHash: string;
-	authHash: string;
 	cycle: string;
 	usage?: Usage;
 	expiresAt?: number;
