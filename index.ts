@@ -291,7 +291,7 @@ export default function (pi: ExtensionAPI): void {
 			const identity: RequestIdentity = { model, provider, sessionId: manager.getSessionId(), branchLength: branch.length, branchHash, authHash: routeDigest(auth) };
 			if (config.cachedSummaries && supportsCachedSummary(model)) {
 				const cache = evidence.cached;
-				const warming = options.maxTokens === 1 && cache && cache.authHash === identity.authHash && sameCachedPrompt(cache.payload, payload) && equal(cache.context, context);
+				const warming = options.maxTokens === 1 && cache && cache.authHash === identity.authHash && sameCachedPrompt(cache.payload, payload, model.api) && equal(cache.context, context);
 				candidate = warming ? { ...cache!, startedAt, cycle: randomUUID(), usage: undefined, expiresAt: undefined } : captureCachedRequest({
 					...identity, context, canonical, options: effectiveOptions, startedAt,
 				}, payload);

@@ -8,6 +8,8 @@ import { createAgentSessionFromServices, createAgentSessionServices, convertToLl
 import extension from "../index";
 import { STREAM_OBSERVER } from "../provider";
 import { openAICompletionsApi } from "@earendil-works/pi-ai/api/openai-completions.lazy";
+import { googleGenerativeAIApi } from "@earendil-works/pi-ai/api/google-generative-ai.lazy";
+import { googleVertexApi } from "@earendil-works/pi-ai/api/google-vertex.lazy";
 import { anthropicMessagesApi } from "@earendil-works/pi-ai/api/anthropic-messages.lazy";
 import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import { azureOpenAIResponsesApi } from "@earendil-works/pi-ai/api/azure-openai-responses.lazy";
@@ -64,6 +66,10 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 			const events = [{ type: "message_start", message: { id: "msg_fixture", type: "message", role: "assistant", model: "fixture", content: [], usage: { input_tokens: 5, output_tokens: 0, cache_read_input_tokens: options.cached ? 15 : 0 } } }, { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }, { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Portable summary fixture" } }, { type: "content_block_stop", index: 0 }, { type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { output_tokens: 4 } }, { type: "message_stop" }];
 			return new Response(events.map((event) => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(""), { headers: { "content-type": "text/event-stream" } });
 		}
+		if (Array.isArray(body.contents)) {
+			const chunk = { candidates: [{ content: { role: "model", parts: [{ text: "Portable summary fixture" }] }, finishReason: "STOP" }], usageMetadata: { promptTokenCount: 20, candidatesTokenCount: 4, totalTokenCount: 24, cachedContentTokenCount: options.cached ? 15 : 0 } };
+			return new Response("data: " + JSON.stringify(chunk) + "\n\n", { headers: { "content-type": "text/event-stream" } });
+		}
 		const summary = JSON.stringify(body).includes("Write a portable context checkpoint");
 		const cap = body.max_output_tokens ?? body.max_completion_tokens ?? body.max_tokens;
 		const truncated = options.summaryLength && JSON.stringify(body).includes("retained-boundary") || summary && options.minimumSummaryTokens !== undefined && typeof cap === "number" && cap < options.minimumSummaryTokens;
@@ -75,7 +81,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 	const modelsPath = options.mixedApis ? join(directory, "models.json") : null;
 	if (modelsPath) await writeFile(modelsPath, JSON.stringify({ providers: { [model.provider]: { models: [{ id: "aux-responses", api: "openai-responses", contextWindow: model.contextWindow, maxTokens: model.maxTokens, cost: model.cost }] } } }));
 	const runtime = await ModelRuntime.create({ credentials, modelsPath, modelsStorePath: join(directory, "models-cache.json"), refreshOnCreate: false });
-	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "openai-completions" ? openAICompletionsApi() : options.api === "anthropic-messages" ? anthropicMessagesApi() : options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
+	const provider = createProvider({ id: model.provider, name: "Fixture", baseUrl: model.baseUrl, models: [model], api: options.api === "openai-completions" ? openAICompletionsApi() : options.api === "anthropic-messages" ? anthropicMessagesApi() : options.api === "google-generative-ai" ? googleGenerativeAIApi() : options.api === "google-vertex" ? googleVertexApi() : options.api === "azure-openai-responses" ? azureOpenAIResponsesApi() : options.api === "openai-codex-responses" ? openAICodexResponsesApi() : openAIResponsesApi(), auth: { apiKey: { name: "Fixture", login: async () => ({ type: "api_key", key: "fixture" }), resolve: async () => { authControl.beforeResolve?.(); return ({ auth: { apiKey: options.api === "openai-codex-responses" ? `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c` : authControl.key, headers: { "x-deleted": null } }, source: "fixture" }); } } } });
 	const legacyStream = provider.streamSimple.bind(provider);
 	if (options.fastFactory) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`, models: [model] });
 	else if (options.legacy) runtime.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: "fixture", models: [model], streamSimple: legacyStream });
@@ -750,6 +756,48 @@ describe("cached portable summaries", () => {
 			await f.session.prompt("Continue unfinished work");
 			expect(f.errors).toEqual([]);
 			if (options.builtin) expect(f.runtime.getRegisteredNativeProvider(options.builtin)).toBeUndefined();
+		} finally { await f.close(); }
+	});
+	test.each(["google-generative-ai", "google-vertex"])("%s reuses the final request prefix for a portable summary", async (api) => {
+		const f = await fixture({ api, cached: true });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			const previous = f.requests.at(-1)!;
+			const before = f.requests.length;
+			const result = await f.session.compact();
+			expect(f.requests).toHaveLength(before + 1);
+			const summary = f.requests.at(-1)!;
+			expect(summary.url).toBe(previous.url);
+			expect(summary.url).toContain(":streamGenerateContent");
+			expect(summary.body.contents.slice(0, -1)).toEqual(previous.body.contents);
+			expect(summary.body.systemInstruction).toEqual(previous.body.systemInstruction);
+			expect(JSON.stringify(summary.body.contents.at(-1))).toContain("Write a portable context checkpoint");
+			expect((result.details as any).providerCompaction.path).toBe("cached");
+			expect(result.usage?.cacheRead).toBe(15);
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+	test("switching APIs retires native state and can acquire a fresh cached summary", async () => {
+		const f = await fixture({ cached: true });
+		try {
+			await f.session.prompt("A ".repeat(1000));
+			await f.session.prompt("B ".repeat(100));
+			expect((await f.session.compact()).details).toMatchObject({ version: 3 });
+			const original = f.session.model!;
+			const google: Model<"google-generative-ai"> = { ...original, api: "google-generative-ai", provider: "google-fixture", id: "gemini-fixture", compat: undefined };
+			f.runtime.registerNativeProvider(createProvider({ id: google.provider, name: "Gemini fixture", baseUrl: google.baseUrl, models: [google], api: googleGenerativeAIApi(), auth: f.provider.auth }));
+			await f.session.setModel(google);
+			await f.session.prompt("C ".repeat(100));
+			const googleBody = f.requests.at(-1)!.body;
+			expect(JSON.stringify(googleBody.contents)).toContain("<summary>");
+			expect(JSON.stringify(googleBody)).not.toContain("native-prefix");
+			const result = await f.session.compact();
+			expect(result.details).toMatchObject({ providerCompaction: { path: "cached" } });
+			await f.session.setModel(original);
+			await f.session.prompt("D new");
+			expect(JSON.stringify(f.requests.at(-1)!.body.input)).not.toContain("native-prefix");
+			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});
 	test("a retained assistant outside the capture is not pulled into the summary", async () => {

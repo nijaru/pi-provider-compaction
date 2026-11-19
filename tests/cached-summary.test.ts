@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { createAssistantMessageEventStream, normalizeContext, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { cachedSummary, captureCachedRequest, cacheConfig, requestCacheState, summaryPayload, summaryInstruction, finishCachedRequest, type CachedRequest } from "../cached-summary";
+import { cachedSummary, captureCachedRequest, cacheConfig, requestCacheState, summaryPayload, summaryInstruction, sameCachedPrompt, finishCachedRequest, type CachedRequest } from "../cached-summary";
 
 const usage = { input: 10, output: 2, cacheRead: 90, cacheWrite: 0, totalTokens: 102, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
 test("Codex cached summaries keep cache identity but never inherit the WebSocket transport", async () => {
@@ -41,6 +41,20 @@ test("summary payload preserves hooks, tools, routing and prefix; only the appen
 	expect(summaryPayload(captured, candidate)).toEqual(candidate);
 	expect(captured.input).toHaveLength(1);
 	for (const changed of [{ ...candidate, tools: [] }, { ...candidate, prompt_cache_key: "different" }, { ...candidate, input: [{ role: "user", content: "redacted" }] }]) expect(() => summaryPayload(captured, changed)).toThrow();
+});
+test("Google summaries preserve policy, reject explicit cache resources and carry the new abort signal", () => {
+	const api = "google-vertex";
+	const abortSignal = new AbortController().signal;
+	const contents = [{ role: "user", parts: [{ text: "history" }] }];
+	const captured = { model: "gemini", contents, config: { systemInstruction: "policy", maxOutputTokens: 1 } };
+	const candidate = { ...captured, contents: [...contents, { role: "user", parts: [{ text: "summarize" }] }], config: { systemInstruction: "policy", maxOutputTokens: 1000, abortSignal } };
+	expect(sameCachedPrompt(captured, { ...candidate, contents }, api)).toBe(true);
+	const result = summaryPayload(captured, candidate, api);
+	expect(result).toEqual(candidate);
+	expect((result.config as typeof candidate.config).abortSignal).toBe(abortSignal);
+	for (const config of [{ ...candidate.config, systemInstruction: "changed" }, { ...candidate.config, cachedContent: "cachedContents/opaque" }]) {
+		expect(() => summaryPayload(captured, { ...candidate, config }, api)).toThrow();
+	}
 });
 test("cache-control movement may extend a coalesced Anthropic user block without changing text", () => {
 	const captured = { messages: [{ role: "user", content: [{ type: "text", text: "history", cache_control: { type: "ephemeral" } }] }], system: [{ type: "text", text: "policy" }] };

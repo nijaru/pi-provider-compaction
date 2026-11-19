@@ -25,8 +25,9 @@ export function cacheConfig(settings: unknown): CacheConfig {
 		cacheRetention: raw.cacheRetention === "long" || raw.cacheRetention === "short" || raw.cacheRetention === "none" ? raw.cacheRetention : undefined,
 	};
 }
+const googleApi = (api: string) => api === "google-generative-ai" || api === "google-vertex";
 export function supportsCachedSummary(model: Model<any> | undefined): boolean {
-	return !!model && ["openai-completions", "openai-responses", "azure-openai-responses", "openai-codex-responses", "anthropic-messages"].includes(model.api);
+	return !!model && (googleApi(model.api) || ["openai-completions", "openai-responses", "azure-openai-responses", "openai-codex-responses", "anthropic-messages"].includes(model.api));
 }
 export interface RequestIdentity {
 	model: Model<any>;
@@ -67,7 +68,18 @@ function cacheNeutral(payload: JsonObject): JsonObject {
 	});
 	return result;
 }
-export function sameCachedPrompt(left: JsonObject, right: unknown): boolean {
+function googlePayload(payload: unknown): payload is JsonObject & { contents: unknown[]; config: JsonObject } {
+	return isObject(payload) && Array.isArray(payload.contents) && isObject(payload.config) && payload.config.cachedContent == null;
+}
+
+function googlePolicy(payload: JsonObject & { config: JsonObject }, includeContents: boolean) {
+	const { maxOutputTokens: _cap, abortSignal: _signal, ...config } = payload.config;
+	const { contents, ...rest } = payload;
+	return { ...rest, config, ...(includeContents ? { contents } : {}) };
+}
+
+export function sameCachedPrompt(left: JsonObject, right: unknown, api = ""): boolean {
+	if (googleApi(api)) return googlePayload(left) && googlePayload(right) && equal(googlePolicy(left, true), googlePolicy(right, true));
 	if (!isObject(right)) return false;
 	const withoutCap = (payload: JsonObject) => Object.fromEntries(Object.entries(payload).filter(([key]) => !["max_tokens", "max_completion_tokens", "max_output_tokens"].includes(key)));
 	return equal(withoutCap(left), withoutCap(right));
@@ -88,7 +100,17 @@ function extendsPrefix(prefix: unknown[], candidate: unknown[]): boolean {
 }
 
 /** Rebuilt context is a validator. Only its proven append and output cap may change the captured request. */
-export function summaryPayload(captured: JsonObject, candidate: unknown): JsonObject {
+export function summaryPayload(captured: JsonObject, candidate: unknown, api = ""): JsonObject {
+	if (googleApi(api)) {
+		if (!googlePayload(captured) || !googlePayload(candidate)) throw new Error("unsupported Google summary payload");
+		if (candidate.contents.length !== captured.contents.length + 1 || !equal(captured.contents, candidate.contents.slice(0, -1))) throw new Error("summary prefix differs");
+		if (!equal(googlePolicy(captured, false), googlePolicy(candidate, false))) throw new Error("summary request policy differs");
+		// AbortSignal here is an SDK option, not a wire field. Use the current
+		// one verbatim; cloning it or reusing the foreground signal breaks aborts.
+		return { ...structuredClone(captured), contents: structuredClone(candidate.contents), config: {
+			...structuredClone(captured.config), maxOutputTokens: candidate.config.maxOutputTokens, abortSignal: candidate.config.abortSignal,
+		} };
+	}
 	const key = wireKey(captured);
 	if (!key || !isObject(candidate) || !Array.isArray(candidate[key])) throw new Error("unsupported summary payload");
 	const before = cacheNeutral(captured) as JsonObject;
@@ -123,12 +145,16 @@ export function summaryPayload(captured: JsonObject, candidate: unknown): JsonOb
 }
 
 export function captureCachedRequest(request: Omit<CachedRequest, "payload" | "cycle" | "usage" | "expiresAt">, payload: unknown): CachedRequest | undefined {
-	if (!supportsCachedSummary(request.model) || !isObject(payload) || !wireKey(payload) || payload.previous_response_id || payload.conversation ||
+	if (!supportsCachedSummary(request.model) || !isObject(payload) || !(googleApi(request.model.api) ? googlePayload(payload) : wireKey(payload)) || payload.previous_response_id || payload.conversation ||
 		Buffer.byteLength(JSON.stringify({ context: request.context, payload })) > MAX_SNAPSHOT_BYTES) return;
 	// Opaque native state cannot replace the readable prefix of a portable summary.
 	if (Array.isArray(payload.input) && payload.input.some((item) => isObject(item) && item.type === "compaction")) return;
 	const { onPayload: _payload, onResponse: _response, onProviderStreamEvent: _events, signal: _signal, ...options } = request.options;
-	return { ...request, context: structuredClone(request.context), canonical: structuredClone(request.canonical), model: structuredClone(request.model), options, payload: structuredClone(payload), cycle: randomUUID() };
+	if (googleApi(request.model.api) && googlePayload(payload)) {
+		const { abortSignal: _abort, ...config } = payload.config;
+		payload = { ...payload, config };
+	}
+	return { ...request, context: structuredClone(request.context), canonical: structuredClone(request.canonical), model: structuredClone(request.model), options, payload: structuredClone(payload) as JsonObject, cycle: randomUUID() };
 }
 
 export function finishCachedRequest(request: CachedRequest, message: AssistantMessage): void {
@@ -219,7 +245,7 @@ export async function cachedSummary(request: CachedRequest, context: Pick<Extens
 			maxTokens: undefined,
 			onPayload: (payload) => {
 				if (!current() || !requestCacheState(request).available) throw new Error("stale summary request");
-				const result = summaryPayload(request.payload, payload); checked = true; return result;
+				const result = summaryPayload(request.payload, payload, request.model.api); checked = true; return result;
 			},
 		}).result();
 		if (!checked || !current()) return { usage: response.usage, reason: "summary request invalidated" };
