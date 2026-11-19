@@ -1,15 +1,15 @@
-import type { Usage } from "@earendil-works/pi-ai";
+import type { Model, Usage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { installObserver, type InstalledObserver } from "./provider";
 
 const REQUEST = "pi-provider-compaction:observe-usage";
 const READY = "pi-provider-compaction:usage-observer-ready";
-type ModelKey = { provider: string; id: string };
+type PricingTarget = Pick<Model<any>, "provider" | "id" | "api" | "baseUrl" | "cost">;
 type PriceUsage = (timestamp: number, usage: Usage) => void;
 interface UsageRequest {
 	context: ExtensionContext;
 	model: NonNullable<ExtensionContext["model"]>;
-	priceFor(model: ModelKey): PriceUsage;
+	priceFor(model: PricingTarget): PriceUsage;
 	respond(observer: InstalledObserver | undefined): void;
 	handled?: boolean;
 }
@@ -29,7 +29,7 @@ export function serveUsageObservers(pi: ExtensionAPI, current: () => ExtensionCo
 				// The SDK header event identifies the owner even when a branch
 				// summary has an independent routing id. Sample policy at dispatch.
 				if (scope.sessionId !== sessionId) return;
-				const price = request.priceFor!({ provider: model.provider, id: model.id });
+				const price = request.priceFor!({ provider: model.provider, id: model.id, api: model.api, baseUrl: model.baseUrl, cost: { ...model.cost } });
 				return Object.assign((payload: unknown) => payload, { priceUsage: (message: { timestamp: number; usage: Usage }) => {
 					price(message.timestamp, message.usage);
 				} });

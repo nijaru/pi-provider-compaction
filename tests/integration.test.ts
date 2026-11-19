@@ -46,7 +46,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 	const authControl: { key: string; beforeResolve?: () => void; beforeNative?: () => void } = { key: "fixture" };
 	globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
 		const url = String(input instanceof Request ? input.url : input);
-		if (!url.startsWith("https://fixture.invalid/")) throw new Error(`Unexpected fixture network: ${url}`);
+		if (!url.startsWith("https://fixture.invalid/") && !(options.fastFactory && url.startsWith("https://chatgpt.com/backend-api/codex/"))) throw new Error(`Unexpected fixture network: ${url}`);
 		const headers = new Headers(init?.headers);
 		const body = JSON.parse(headers.get("content-encoding") === "zstd" ? zstdDecompressSync(init!.body as Uint8Array).toString() : String(init?.body));
 		requests.push({ url, body, headers: new Headers(init?.headers) });
@@ -75,7 +75,7 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 		const truncated = options.summaryLength && JSON.stringify(body).includes("retained-boundary") || summary && options.minimumSummaryTokens !== undefined && typeof cap === "number" && cap < options.minimumSummaryTokens;
 		return completion("Portable summary fixture", options.cached, truncated);
 	}) as typeof fetch;
-	const model: Model<any> = { provider: options.builtin ?? (options.fastFactory ? "openai-codex" : "fixture"), api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-6.1-sol" : "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", reasoning: options.thinking ?? false, ...(options.cacheTtl ? { promptCache: { short: options.cacheTtl, long: options.cacheTtl * 2 } } : {}), compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: options.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
+	const model: Model<any> = { provider: options.builtin ?? (options.fastFactory ? "openai-codex" : "fixture"), api: options.api ?? "openai-responses", id: options.fastFactory ? "gpt-6.1-sol" : "fixture", name: "Fixture", baseUrl: options.fastFactory ? "https://chatgpt.com/backend-api" : "https://fixture.invalid/v1", reasoning: options.thinking ?? false, ...(options.cacheTtl ? { promptCache: { short: options.cacheTtl, long: options.cacheTtl * 2 } } : {}), compat: { supportsMidConvoEffort: options.thinking ?? false }, input: ["text", "image"], contextWindow: 100000, maxTokens: 4096, cost: options.cost ?? { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 } };
 	const credentials = new InMemoryCredentialStore();
 	if (options.builtin || options.mixedApis) await credentials.modify(model.provider, async () => ({ type: "api_key", key: "fixture" }));
 	const modelsPath = options.mixedApis ? join(directory, "models.json") : null;
@@ -112,8 +112,9 @@ describe("Pi runner + real Responses adapter", () => {
 			pi.on("session_start", (_event, context) => {
 				pi.events.emit("pi-provider-compaction:observe-usage", {
 					context, model: context.model,
-					priceFor: () => (_timestamp: number, value: import("@earendil-works/pi-ai").Usage) => {
+					priceFor: (target: unknown) => (_timestamp: number, value: import("@earendil-works/pi-ai").Usage) => {
 						if (!flags.length) return;
+						expect(target).toMatchObject({ provider: "fixture", id: "fixture", api: "openai-responses", baseUrl: "https://fixture.invalid/v1", cost: { input: 0 } });
 						value.cost.totalFromProvider = flags.shift()!;
 						value.cost.total = 0.25;
 						priced++;
