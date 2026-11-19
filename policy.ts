@@ -12,6 +12,7 @@ import {
 	hasTrustRequiringProjectResources,
 	ProjectTrustStore,
 } from "@earendil-works/pi-coding-agent";
+import * as host from "@earendil-works/pi-coding-agent";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { closeSync, constants as fsConstants, fstatSync, openSync, readSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
@@ -131,6 +132,7 @@ function isProjectPolicyTrusted(ctx: PolicyContext, agentDir: string): boolean {
  * Last occurrence wins, matching Pi's Map.set behavior.
  */
 export function readCompactionModelFlagFromArgv(argv: readonly string[] = process.argv.slice(2)): string | boolean | undefined {
+	if (typeof host.parseArgs === "function") return host.parseArgs([...argv]).unknownFlags?.get(COMPACTION_MODEL_FLAG);
 	let value: string | boolean | undefined;
 	const prefix = `--${COMPACTION_MODEL_FLAG}=`;
 	for (let i = 0; i < argv.length; i++) {

@@ -83,9 +83,12 @@ function serializePrefix(model: Model<any>, snapshot: PreparedRequest, prefix: T
 }
 
 /** No open/synthetic tool exchange may cross the coverage boundary. */
-function closedTools(context: TranscriptContext): boolean {
+export function closedTools(context: TranscriptContext): boolean {
 	const pending = new Set<string>();
 	for (const message of context.messages) {
+		// Pi repairs pending calls before any new user or assistant message.
+		// System updates are transparent to that tool-exchange accounting.
+		if (pending.size && message.role !== "system" && message.role !== "toolResult") return false;
 		if (message.role === "assistant") {
 			if (message.stopReason === "error" || message.stopReason === "aborted") return false;
 			for (const block of message.content) if (block.type === "toolCall") {

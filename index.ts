@@ -443,7 +443,9 @@ export default function (pi: ExtensionAPI): void {
 				portable.usage = combineUsage(attemptedUsage, portable.usage);
 			} catch {
 				if (!current()) return cancelled(attemptedUsage);
-				return reject("portable summary generation failed");
+				// Returning undefined here would ask Pi to retry a standard summary
+				// that we already attempted, and would lose the known cached bill.
+				return cancelled(attemptedUsage, "portable summary generation failed");
 			}
 		}
 		if (!current() || !portable.summary.trim() || portable.summary === NATIVE_COMPACTION_SUMMARY) return cancelled(portable.usage);
@@ -498,20 +500,23 @@ export default function (pi: ExtensionAPI): void {
 		}
 	});
 	pi.on("session_compact", (event, context) => {
-		const recorded = isObject(event.compactionEntry.details) ? event.compactionEntry.details.providerCompaction : undefined;
+		const branch = context.sessionManager.getBranch();
+		// Some Pi versions find the event entry by summary text, which can point to
+		// an older compaction. Use the current branch and still verify ownership below.
+		const entry = latestCompaction(branch);
+		const recorded = isObject(entry?.details) ? entry.details.providerCompaction : undefined;
 		const owned = isObject(recorded) && equal(recorded, lastOutcome);
-		if (!owned && !fallbackReason && readNativeCompactionDetails(event.compactionEntry.details)?.version !== 3) fallback("another handler supplied the committed result");
+		if (!owned && !fallbackReason && readNativeCompactionDetails(entry?.details)?.version !== 3) fallback("another handler supplied the committed result");
 		// Only static diagnostics are persisted, never request/auth data or error text.
 		if (fallbackReason) pi.appendEntry("pi-provider-compaction:diagnostic", { status: `portable: ${fallbackReason}` });
 		active = undefined; observation = undefined;
 		const candidate = pending; pending = undefined;
-		if (!candidate || !equal(event.compactionEntry.details, candidate.details) || event.compactionEntry.summary !== candidate.summary) return;
-		const branch = context.sessionManager.getBranch();
+		if (!candidate || !entry || entry.summary !== event.compactionEntry.summary || !equal(entry.details, candidate.details) || entry.summary !== candidate.summary) return;
 		const coverage = candidate.details.coverage;
-		const index = branch.findIndex((entry) => entry.id === event.compactionEntry.id);
-		if (!coverage || index < 0 || event.compactionEntry.firstKeptEntryId !== coverage.firstKeptEntryId || event.compactionEntry.parentId !== coverage.sourceLeafId || digest(branch.slice(0, index)) !== coverage.sourceHash) return;
+		const index = branch.indexOf(entry);
+		if (!coverage || entry.firstKeptEntryId !== coverage.firstKeptEntryId || entry.parentId !== coverage.sourceLeafId || digest(branch.slice(0, index)) !== coverage.sourceHash) return;
 		active = {
-			entryId: event.compactionEntry.id,
+			entryId: entry.id,
 			summary: candidate.summary,
 			branchLength: index + 1,
 			branchHash: digest(branch.slice(0, index + 1)),

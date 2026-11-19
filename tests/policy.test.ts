@@ -73,6 +73,11 @@ describe("generic-model precedence", () => {
 		for (const next of ["--other-flag", "@prompt.txt"]) expect(readCompactionModelFlagFromArgv(["--compaction-model", next])).toBe(true);
 	});
 
+	test("a flag-shaped built-in option value does not override policy", () => {
+		writeAgentPolicy(["agent/model"]);
+		checkPolicy(["--system-prompt", "--compaction-model=literal-prompt"], agent);
+	});
+
 	test("an oversized flag disables selection without rescuing it from a policy", () => {
 		writeAgentPolicy(["agent/model"]);
 		checkPolicy(["--compaction-model", "x".repeat(513)], none);

@@ -4,7 +4,7 @@ import { convertToLlm } from "@earendil-works/pi-coding-agent";
 import { normalizeContext } from "@earendil-works/pi-ai";
 import { type compact, type CompactionResult, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 type CompactionPreparation = Parameters<typeof compact>[0];
-import { equal, MAX_SNAPSHOT_BYTES } from "./replay";
+import { closedTools, equal, MAX_SNAPSHOT_BYTES } from "./replay";
 import { isObject, type JsonObject } from "./protocol";
 
 export interface CacheState {
@@ -151,20 +151,7 @@ export function requestCacheState(request: CachedRequest | undefined, reason?: s
 		inputTokens: (usage?.input ?? 0) + cachedTokens };
 }
 
-function closedTools(context: TranscriptContext): boolean {
-	const pending = new Set<string>();
-	for (const message of context.messages) {
-		if (message.role === "assistant") {
-			if (message.stopReason === "error" || message.stopReason === "aborted") return false;
-			for (const block of message.content) if (block.type === "toolCall") {
-				if (pending.has(block.id)) return false;
-				pending.add(block.id);
-			}
-		} else if (message.role === "toolResult" && !pending.delete(message.toolCallId)) return false;
-	}
-	return pending.size === 0;
-}
-export function summaryBoundary(request: CachedRequest, context: ExtensionContext, firstKeptEntryId: string): number | undefined {
+export function summaryBoundary(request: CachedRequest, context: Pick<ExtensionContext, "sessionManager">, firstKeptEntryId: string): number | undefined {
 	const projection = context.sessionManager.buildSessionProjection();
 	const boundary = projection.entries.findIndex((entry) => entry.sourceEntry.id === firstKeptEntryId);
 	if (boundary < 0) return;
@@ -213,7 +200,7 @@ export function withFileTracking(result: CompactionResult, preparation: Compacti
 	return { ...result, summary: result.summary.replace(/<(read-files|modified-files)>[\s\S]*?<\/\1>/g, "").trim() + files, details: { ...(isObject(result.details) ? result.details : {}), readFiles, modifiedFiles } };
 }
 
-export async function cachedSummary(request: CachedRequest, context: ExtensionContext, preparation: CompactionPreparation, instructions: string | undefined, signal: AbortSignal, current: () => boolean): Promise<{ result?: CompactionResult; usage?: Usage; reason?: string }> {
+export async function cachedSummary(request: CachedRequest, context: Pick<ExtensionContext, "sessionManager">, preparation: CompactionPreparation, instructions: string | undefined, signal: AbortSignal, current: () => boolean): Promise<{ result?: CompactionResult; usage?: Usage; reason?: string }> {
 	const boundary = summaryBoundary(request, context, preparation.firstKeptEntryId);
 	if (boundary === undefined) return { reason: "summary coverage or retained boundary cannot be proved" };
 	let checked = false;
@@ -223,6 +210,9 @@ export async function cachedSummary(request: CachedRequest, context: ExtensionCo
 			// Reuse the prompt cache, never the foreground conversation's mutable
 			// continuation state, including when this summary is later discarded.
 			disableContinuation: true,
+			// Codex ignores disableContinuation on WebSockets. SSE preserves the
+			// prompt cache key without accessing the foreground socket state.
+			...(request.model.api === "openai-codex-responses" ? { transport: "sse" as const } : {}),
 			// reserveTokens is a compaction trigger, not a summary budget. Let the
 			// adapter use its model output limit and context clamp, as Pi does; do
 			// not inherit a one-token cache-warmer or caller-specific output cap.

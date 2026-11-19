@@ -28,9 +28,10 @@ export function serveUsageObservers(pi: ExtensionAPI, current: () => ExtensionCo
 			const installed = installObserver(pi, { model: request.model, modelRegistry: owner.modelRegistry }, (model, _context, _options, scope) => {
 				// The SDK header event identifies the owner even when a branch
 				// summary has an independent routing id. Sample policy at dispatch.
+				if (scope.sessionId !== sessionId) return;
 				const price = request.priceFor!({ provider: model.provider, id: model.id });
 				return Object.assign((payload: unknown) => payload, { priceUsage: (message: { timestamp: number; usage: Usage }) => {
-					if (scope.sessionId === sessionId) price(message.timestamp, message.usage);
+					price(message.timestamp, message.usage);
 				} });
 			});
 			if (!installed) { request.respond(undefined); return; }

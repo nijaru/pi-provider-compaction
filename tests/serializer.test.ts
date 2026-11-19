@@ -90,4 +90,13 @@ test("missing tool result repairs cannot prove a closed coverage boundary", () =
 	const context = normalizeContext({ messages: [{ role: "user", content: "A", timestamp: 1 }, { role: "assistant", api: model.api, provider: model.provider, model: model.id, content: [{ type: "toolCall", id: "call", name: "edit", arguments: {} }], usage, stopReason: "toolUse", timestamp: 2 }, { role: "user", content: "B", timestamp: 3 }] });
 	const snapshot = capturePreparedRequest(model, context, context, { input: serializeInput(model, context) })!;
 	expect(selectCoveredPrefix(model, snapshot, normalizeContext({ messages: context.messages.slice(0, 2) }))).toBeUndefined();
+	const late = { role: "toolResult", toolCallId: "call", toolName: "edit", content: [{ type: "text", text: "done" }], isError: false, timestamp: 4 } as const;
+	const result = { ...late, content: [...late.content] };
+	const interrupted = normalizeContext({ messages: [...context.messages, result] });
+	const interruptedSnapshot = capturePreparedRequest(model, interrupted, interrupted, { input: serializeInput(model, interrupted) })!;
+	expect(JSON.stringify(interruptedSnapshot.portableInput)).toContain("No result provided");
+	expect(selectCoveredPrefix(model, interruptedSnapshot, interrupted)).toBeUndefined();
+	const uninterrupted = normalizeContext({ messages: [...context.messages.slice(0, 2), result, ...context.messages.slice(2)] });
+	const uninterruptedSnapshot = capturePreparedRequest(model, uninterrupted, uninterrupted, { input: serializeInput(model, uninterrupted) })!;
+	expect(selectCoveredPrefix(model, uninterruptedSnapshot, uninterrupted)).toBeDefined();
 });

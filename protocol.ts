@@ -158,6 +158,7 @@ function compactPayload(payload: JsonObject): JsonObject {
 		"previous_response_id",
 		"prompt_cache_key",
 		"prompt_cache_retention",
+		"prompt_cache_options",
 		"service_tier",
 	] as const;
 	const result: JsonObject = {};
@@ -189,6 +190,7 @@ function syntheticCompletion(response: JsonObject, payload: JsonObject): Respons
 		created_at: typeof response.created_at === "number" ? response.created_at : Math.floor(Date.now() / 1000),
 		status: "completed",
 		model: payload.model,
+		service_tier: typeof response.service_tier === "string" ? response.service_tier : payload.service_tier,
 		output: [],
 		parallel_tool_calls: false,
 		tool_choice: "auto",
@@ -304,7 +306,9 @@ async function requestResponsesCompact(request: TransportRequest): Promise<Trans
 			if (!isObject(payload)) throw new Error("Responses provider exposed a non-object payload");
 			if (request.preparedPayload && request.preparedPayload.model !== payload.model) throw new Error("Native route model changed since capture");
 			preparedPayload = { ...structuredClone(request.preparedPayload ?? payload), input: structuredClone(request.input) };
-			return preparedPayload;
+			// The bridge feeds an SSE completion back to Pi, even though /compact
+			// itself returns JSON and the outgoing allowlist drops stream.
+			return { ...preparedPayload, stream: true };
 		},
 	});
 
@@ -336,14 +340,16 @@ async function collectCompactionSse(stream: ReadableStream<Uint8Array>, signal: 
 		if (dataLines.length === 0) return;
 		const data = dataLines.join("\n");
 		dataLines = [];
-		if (data === "[DONE]") return;
+		if (data === "[DONE]") throw new Error("Remote V2 ended without a terminal response");
 		let event: unknown;
 		try { event = JSON.parse(data); } catch { throw new Error("Remote V2 returned malformed SSE JSON"); }
 		if (!isObject(event)) return;
-		if (event.type === "response.completed") completed = true;
+		if (event.type === "error" || event.type === "response.failed" || event.type === "response.incomplete") throw new Error("Remote V2 did not complete successfully");
+		completed = event.type === "response.completed" || event.type === "response.done";
+		if (completed && isObject(event.response) && typeof event.response.status === "string" && event.response.status !== "completed") throw new Error("Remote V2 returned an unsuccessful terminal response");
 		const candidates: unknown[] = [];
 		if (event.type === "response.output_item.done") candidates.push(event.item);
-		if (event.type === "response.completed" && isObject(event.response) && Array.isArray(event.response.output)) {
+		if (completed && isObject(event.response) && Array.isArray(event.response.output)) {
 			candidates.push(...event.response.output);
 		}
 		for (const candidate of candidates) {
@@ -358,7 +364,9 @@ async function collectCompactionSse(stream: ReadableStream<Uint8Array>, signal: 
 		if (line.startsWith("data:")) dataLines.push(line.slice(5).replace(/^ /, ""));
 	};
 	try {
-		while (true) {
+		// Pi stops reading its tee branch at the terminal event. Release our
+		// branch there too, without relying on the server to close the body.
+		while (!completed) {
 			if (signal.aborted) throw new DOMException("Compaction aborted", "AbortError");
 			const { done, value } = await reader.read();
 			if (done) break;
@@ -366,22 +374,24 @@ async function collectCompactionSse(stream: ReadableStream<Uint8Array>, signal: 
 			if (bytes > MAX_RESPONSE_BYTES) throw new Error("Remote V2 stream exceeded 8 MiB");
 			pending += decoder.decode(value, { stream: true });
 			let newline = pending.indexOf("\n");
-			while (newline >= 0) {
+			while (!completed && newline >= 0) {
 				const raw = pending.slice(0, newline);
 				pending = pending.slice(newline + 1);
 				processLine(raw.endsWith("\r") ? raw.slice(0, -1) : raw);
 				newline = pending.indexOf("\n");
 			}
 		}
-		pending += decoder.decode();
-		if (pending) processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
-		dispatch();
+		if (!completed) {
+			pending += decoder.decode();
+			if (pending) processLine(pending.endsWith("\r") ? pending.slice(0, -1) : pending);
+			dispatch();
+		}
 	} finally {
 		signal.removeEventListener("abort", onAbort);
 		void reader.cancel().catch(() => undefined);
 		reader.releaseLock();
 	}
-	if (!completed) throw new Error("Remote V2 stream ended without response.completed");
+	if (!completed) throw new Error("Remote V2 stream ended without a terminal response");
 	if (items.size !== 1) throw new Error(`Remote V2 returned ${items.size} distinct compaction items; expected exactly one`);
 	return { item: [...items.values()][0] };
 }

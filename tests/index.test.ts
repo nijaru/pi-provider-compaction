@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import { normalizeContext } from "@earendil-works/pi-ai";
+import { createProvider, normalizeContext } from "@earendil-works/pi-ai";
+import { openAICodexResponsesApi } from "@earendil-works/pi-ai/api/openai-codex-responses.lazy";
+import { openAIResponsesApi } from "@earendil-works/pi-ai/api/openai-responses.lazy";
 import type { Model, Usage } from "@earendil-works/pi-ai";
 import { supportsNativeCompaction } from "../index";
 import {
@@ -92,6 +94,7 @@ describe("standalone Responses bridge", () => {
 						stream: true,
 						store: false,
 						prompt_cache_key: "session",
+						prompt_cache_options: { mode: "explicit" },
 					});
 					const response = await options.fetch(
 						"https://example.openai.azure.com/openai/v1/responses?api-version=2026-08-01",
@@ -142,9 +145,22 @@ describe("standalone Responses bridge", () => {
 			model: "azure-deployment",
 			input: [{ type: "message", role: "user", content: "native-history" }],
 			prompt_cache_key: "session",
+			prompt_cache_options: { mode: "explicit" },
 		});
 		expect(result.output.at(-1)).toEqual(checkpoint);
 		expect(result.usage).toEqual(usage);
+	});
+
+	test.each([undefined, "default"] as const)("prices the tier used for Compact (reported=%s)", async (tier) => {
+		const provider = createProvider({ id: directModel.provider, name: "Fixture", auth: {}, models: [directModel], api: openAIResponsesApi() });
+		const input = [{ role: "user", content: "history" }];
+		const result = await requestProviderCompaction({
+			provider, model: directModel, protocol: "responses-compact", input,
+			preparedPayload: { model: directModel.id, input, service_tier: "flex" },
+			context: normalizeContext({ messages: [] }), apiKey: "fixture", signal: AbortSignal.timeout(1500),
+			fetch: (async () => Response.json({ output: [checkpoint], service_tier: tier, usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 } })) as unknown as typeof fetch,
+		});
+		expect(result.usage.cost.total).toBeCloseTo((tier ? 28 : 14) / 1e6, 12);
 	});
 
 	test("preserves the full canonical compact output and rejects malformed checkpoints", () => {
@@ -156,6 +172,30 @@ describe("standalone Responses bridge", () => {
 });
 
 describe("Codex Remote V2 bridge", () => {
+	test.each(["response.completed", "response.done", "response.incomplete"])("releases an open response body at %s", async (type) => {
+		const provider = createProvider({ id: codexModel.provider, name: "Fixture", auth: {}, models: [codexModel], api: openAICodexResponsesApi() });
+		const controller = new AbortController();
+		const timeout = setTimeout(() => controller.abort(), 1500);
+		let cancelled = false;
+		try {
+			const result = requestProviderCompaction({
+				provider, model: codexModel, protocol: "remote-v2", input: [], context: normalizeContext({ messages: [] }),
+				apiKey: "a." + Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture" } })).toString("base64url") + ".c",
+				signal: controller.signal,
+				fetch: (async () => new Response(new ReadableStream({
+					start(stream) {
+						const response = { status: type === "response.incomplete" ? "incomplete" : "completed", output: [checkpoint], usage: { input_tokens: 20, output_tokens: 4, total_tokens: 24 } };
+						stream.enqueue(new TextEncoder().encode("data: " + JSON.stringify({ type, response }) + "\n\n"));
+					},
+					cancel() { cancelled = true; },
+				}), { headers: { "content-type": "text/event-stream" } })) as unknown as typeof fetch,
+			});
+			if (type === "response.incomplete") await expect(result).rejects.toMatchObject({ usage: { totalTokens: 24 } });
+			else await expect(result).resolves.toMatchObject({ output: [checkpoint], usage: { totalTokens: 24 } });
+			expect(controller.signal.aborted).toBe(false);
+			expect(cancelled).toBe(true);
+		} finally { clearTimeout(timeout); }
+	});
 	test("appends compaction_trigger through Pi's Codex transport and captures the emitted checkpoint", async () => {
 		let prepared: any;
 		const provider = {

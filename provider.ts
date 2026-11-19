@@ -60,17 +60,25 @@ function pricedStream(stream: AssistantMessageEventStream, model: Model<any>, ha
 	void (async () => {
 		let final: AssistantMessage | undefined;
 		let partial: AssistantMessage | undefined;
+		let resolved: AssistantMessage | undefined;
+		const observeResult = (message: AssistantMessage) => {
+			try { handler.priceUsage?.(message); } catch { /* Optional estimates never veto completion. */ }
+			try { handler.complete?.(message); } catch { /* Capture failure never vetoes completion. */ }
+		};
 		try {
+			// A valid Pi stream may finish with end(message) alone. Sample that
+			// result without waiting indefinitely for a malformed end() with no message.
+			void stream.result().then((message) => { resolved = message; }, () => {});
 			for await (const event of stream) {
 				if ("partial" in event) partial = event.partial;
 				if (event.type === "done" || event.type === "error") {
 					final = event.type === "done" ? event.message : event.error;
-					try { handler.priceUsage?.(final); } catch { /* Optional estimates never veto completion. */ }
-					try { handler.complete?.(final); } catch { /* Capture failure never vetoes completion. */ }
+					observeResult(final);
 				}
 				out.push(event);
 			}
 			if (final) { out.end(final); return; }
+			if (resolved) { observeResult(resolved); out.end(resolved); return; }
 		} catch { /* Malformed plugin streams still need a terminal outcome. */ }
 		const message: AssistantMessage = {
 			...(partial ?? {
@@ -106,7 +114,11 @@ function observerLeases(provider: string, owned: () => boolean, restore: () => v
 				if (!active(token)) continue;
 				const handler = lease.observe(...args);
 				if (!handler) continue;
-				handlers.push(Object.assign((payload: unknown) => active(token) ? handler(payload) : payload, {
+				handlers.push(Object.assign(async (payload: unknown) => {
+					if (!active(token)) return payload;
+					const replacement = await handler(payload);
+					return active(token) ? replacement : payload;
+				}, {
 					cacheRetention: handler.cacheRetention,
 					// A catalog/API recomposition may detach a provider after dispatch.
 					// Its in-flight bill still uses the sampled policy; explicit lease
@@ -242,6 +254,9 @@ export function installObserver(pi: ExtensionAPI, ctx: Pick<ExtensionContext, "m
 	};
 	const native = registry.getRegisteredNativeProvider(id);
 	if (native) {
+		// Use one in-place dispatcher for mixed APIs. Re-registering the native
+		// base would tear down an effective lease already serving an overlay API.
+		if (new Set(registry.getAll?.().filter((entry) => entry.provider === id).map((entry) => entry.api)).size > 1) return effective();
 		// Pi composes a native base only when its catalog serves the active API.
 		// Otherwise the request goes to the global API provider and bypasses this
 		// wrapper; claiming an observer there would report native compaction as

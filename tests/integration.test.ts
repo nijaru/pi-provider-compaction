@@ -38,7 +38,7 @@ async function loadExternalExtension(path: string): Promise<(pi: ExtensionAPI, o
 	return (await import(`data:text/javascript;base64,${Buffer.from(await built.outputs[0]!.text()).toString("base64")}`)).default;
 }
 
-async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; firstHooks?: (pi: ExtensionAPI) => void; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; invalidNative?: boolean; mixedApis?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean; cached?: boolean; cacheTtl?: number; settings?: Record<string, unknown>; beforeReply?: (body: any) => void; builtin?: string; summaryLength?: boolean; minimumSummaryTokens?: number; cost?: Model<any>["cost"]; seed?: (manager: SessionManager, model: Model<any>) => void } = {}) {
+async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst?: boolean; firstHooks?: (pi: ExtensionAPI) => void; flagValues?: Map<string, string | boolean>; nativeFailure?: boolean; invalidNative?: boolean; mixedApis?: boolean; api?: string; thinking?: boolean; fastFactory?: (pi: ExtensionAPI) => void; legacy?: boolean; cached?: boolean; cacheTtl?: number; settings?: Record<string, unknown>; beforeReply?: (body: any) => void | Response | Promise<void | Response>; builtin?: string; summaryLength?: boolean; minimumSummaryTokens?: number; cost?: Model<any>["cost"]; seed?: (manager: SessionManager, model: Model<any>) => void } = {}) {
 	const directory = await mkdtemp(join(tmpdir(), "provider-compaction-fixture-"));
 	const requests: { url: string; body: any; headers: Headers }[] = [];
 	const authControl: { key: string; beforeResolve?: () => void; beforeNative?: () => void } = { key: "fixture" };
@@ -54,7 +54,8 @@ async function fixture(options: { hooks?: (pi: ExtensionAPI) => void; hooksFirst
 			const response = { id: "resp_native", status: "completed", output: options.invalidNative ? [] : [checkpoint], usage };
 			return new Response(`data: ${JSON.stringify({ type: "response.completed", response })}\n\n`, { headers: { "content-type": "text/event-stream" } });
 		}
-		await options.beforeReply?.(body);
+		const override = await options.beforeReply?.(body);
+		if (override instanceof Response) return override;
 		if (options.api === "openai-completions" && !body.input) {
 			const chunks = [{ choices: [{ index: 0, delta: { role: "assistant", content: "Portable summary fixture" }, finish_reason: null }] }, { choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 20, completion_tokens: 4, total_tokens: 24, prompt_tokens_details: { cached_tokens: options.cached ? 15 : 0 } } }];
 			return new Response(chunks.map((chunk) => `data: ${JSON.stringify({ id: "chatcmpl_fixture", model: "fixture", ...chunk })}\n\n`).join("") + "data: [DONE]\n\n", { headers: { "content-type": "text/event-stream" } });
@@ -379,16 +380,20 @@ describe("Pi runner + real Responses adapter", () => {
 		try {
 			await f.session.prompt("A ".repeat(1000));
 			await f.session.prompt("B ".repeat(100));
-			await f.session.compact();
+			const first = await f.session.compact();
 			await f.session.prompt("C ".repeat(100));
-			await f.session.compact();
+			const second = await f.session.compact();
+			// Pi can report the older entry in session_compact when summary text repeats.
+			expect(second.summary).toBe(first.summary);
 			const native = f.requests.filter((request) => new URL(request.url).pathname.endsWith("/compact"));
 			expect(native).toHaveLength(2);
 			expect(native[1]!.body.input).toContainEqual(checkpoint);
 			expect(JSON.stringify(native[1]!.body.input)).toContain("B B B");
 			expect(JSON.stringify(native[1]!.body.input)).not.toContain("C C C");
 			await f.session.prompt("D new");
-			const last = JSON.stringify(f.requests.at(-1)!.body.input);
+			const lastInput = f.requests.at(-1)!.body.input;
+			expect(lastInput).toContainEqual(checkpoint);
+			const last = JSON.stringify(lastInput);
 			expect(last).toContain("C C C");
 			expect(last).not.toContain("B B B");
 			expect(f.errors).toEqual([]);
@@ -793,6 +798,19 @@ describe("cached portable summaries", () => {
 				expect((result.details as any).providerCompaction.path).toBe("standard + native");
 				expect(result.usage?.cacheRead).toBe(30);
 			}
+			expect(f.errors).toEqual([]);
+		} finally { await f.close(); }
+	});
+	test("a failed standard fallback does not trigger another summary or lose the cached bill", async () => {
+		const f = await fixture({ cached: true, summaryLength: true, beforeReply(body) {
+			if (JSON.stringify(body).includes("<conversation>")) return Response.json({ error: { message: "fixture failure" } }, { status: 400 });
+		} });
+		try {
+			await f.session.prompt("A ".repeat(1000)); await f.session.prompt("B ".repeat(100));
+			const before = f.requests.length;
+			await expect(f.session.compact()).rejects.toThrow("Compaction cancelled");
+			expect(f.requests).toHaveLength(before + 2);
+			expect(f.manager.getBranch().at(-1)).toMatchObject({ type: "custom", customType: "pi-provider-compaction:diagnostic", data: { status: "cancelled: portable summary generation failed", usage: { cacheRead: 15 } } });
 			expect(f.errors).toEqual([]);
 		} finally { await f.close(); }
 	});

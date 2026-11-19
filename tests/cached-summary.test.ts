@@ -1,7 +1,39 @@
 import { expect, test } from "bun:test";
-import { cacheConfig, requestCacheState, summaryPayload, summaryInstruction, finishCachedRequest, type CachedRequest } from "../cached-summary";
+import { createAssistantMessageEventStream, normalizeContext, type Model, type Provider, type SimpleStreamOptions } from "@earendil-works/pi-ai";
+import { SessionManager } from "@earendil-works/pi-coding-agent";
+import { cachedSummary, captureCachedRequest, cacheConfig, requestCacheState, summaryPayload, summaryInstruction, finishCachedRequest, type CachedRequest } from "../cached-summary";
 
 const usage = { input: 10, output: 2, cacheRead: 90, cacheWrite: 0, totalTokens: 102, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+test("Codex cached summaries keep cache identity but never inherit the WebSocket transport", async () => {
+	const manager = SessionManager.inMemory();
+	const user = { role: "user", content: "History", timestamp: 1 } as const;
+	manager.appendMessage(user);
+	const firstKeptEntryId = manager.appendMessage({ role: "user", content: "Retained", timestamp: 2 });
+	const context = normalizeContext({ messages: [user] });
+	const model = { provider: "openai-codex", api: "openai-codex-responses", id: "fixture" } as Model<any>;
+	const sessionId = manager.getSessionId();
+	const payload = { model: model.id, prompt_cache_key: sessionId, input: [{ role: "user", content: "History" }] };
+	let sent: SimpleStreamOptions | undefined;
+	const provider = { streamSimple: (_model, _context, options) => {
+		sent = options;
+		const stream = createAssistantMessageEventStream();
+		void Promise.resolve(options?.onPayload?.({ ...payload, input: [...payload.input, { role: "user", content: "Summarize" }] }, model)).then(() => {
+			stream.end({ role: "assistant", api: model.api, provider: model.provider, model: model.id, timestamp: Date.now(), content: [{ type: "text", text: "Summary" }], stopReason: "stop", usage });
+		});
+		return stream;
+	} } satisfies Pick<Provider, "streamSimple">;
+	const request = captureCachedRequest({
+		model, provider: provider as Provider, context, canonical: context, options: { sessionId, transport: "websocket-cached" },
+		startedAt: Date.now(), sessionId, branchLength: 1, branchHash: "", authHash: "",
+	}, payload)!;
+	request.usage = usage;
+	const result = await cachedSummary(request, { sessionManager: manager },
+		{ firstKeptEntryId, tokensBefore: 10, fileOps: { read: new Set(), edited: new Set(), written: new Set() } } as Parameters<typeof cachedSummary>[2],
+		undefined, new AbortController().signal, () => true);
+	expect(result.result?.summary).toBe("Summary");
+	expect(sent).toMatchObject({ sessionId, transport: "sse", disableContinuation: true });
+});
+
 test("summary payload preserves hooks, tools, routing and prefix; only the append/cap change", () => {
 	const input = [{ role: "user", content: [{ type: "input_text", text: "history" }] }];
 	const captured = { model: "fixture", input, tools: [{ name: "read" }], service_tier: "priority", prompt_cache_key: "session", max_output_tokens: 8192 };
