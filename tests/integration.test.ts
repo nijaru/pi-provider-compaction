@@ -349,12 +349,18 @@ describe("Pi runner + real Responses adapter", () => {
 			expect(f.errors).toEqual([]);
 			const native = f.requests.find((request) => new URL(request.url).pathname.endsWith("/compact") || request.body.input?.some((item: any) => item.type === "compaction_trigger"));
 			expect(native).toBeDefined();
+			if (api === "openai-codex-responses") {
+				expect(native!.body.instructions).toBeUndefined();
+				expect(native!.body.input[0]).toEqual(f.requests[0]!.body.input[0]);
+				expect(native!.body.input[0].content).toContain("Fixture policy");
+			}
 			expect(JSON.stringify(native!.body.input)).toContain("A A A");
 			expect(JSON.stringify(native!.body.input)).not.toContain("B B B");
 			expect((result.details as any).version).toBe(3);
 			await f.session.prompt("C new");
 			const last = f.requests.at(-1)!.body;
 			expect(last.input).toContainEqual(checkpoint);
+			if (api === "openai-codex-responses") expect(last.input[0]).toEqual(f.requests[0]!.body.input[0]);
 			expect(JSON.stringify(last.input)).toContain("B B B");
 			expect(JSON.stringify(last.input)).toContain("C new");
 			expect(last.input.filter((item: any) => JSON.stringify(item).includes("B B B"))).toHaveLength(1);

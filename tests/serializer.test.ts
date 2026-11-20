@@ -37,8 +37,8 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 		expect(payload.input.some((item: any) => item.type === "custom_tool_call")).toBe(true);
 		expect(payload.input.some((item: any) => item.type === "custom_tool_call_output")).toBe(true);
 		expect(capturePreparedRequest(model, context, context, payload)).toBeDefined();
-		if (api === "openai-codex-responses") expect(payload.instructions).toContain("forced policy");
-		else expect(payload.input).toContainEqual(expect.objectContaining({ role: "developer", content: expect.stringContaining("forced policy") }));
+		expect(payload.instructions).toBeUndefined();
+		expect(payload.input).toContainEqual(expect.objectContaining({ role: "developer", content: expect.stringContaining("forced policy") }));
 		const snapshot = capturePreparedRequest(model, context, context, payload)!;
 		const split = normalizeContext({ messages: context.messages.slice(0, 3) });
 		expect(selectCoveredPrefix(model, snapshot, split)).toBeUndefined();
@@ -59,15 +59,16 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 	});
 }
 
-test("effort updates preserve exact history, prefix boundaries and the request-only suffix", async () => {
-	const model = { api: "openai-responses", provider: "openai", id: "fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, compat: { supportsMidConvoEffort: true } } as Model<any>;
+for (const [api, provider, adapter] of [["openai-responses", "openai", direct], ["openai-codex-responses", "openai-codex", codex]] as const) test(`${api}: effort updates preserve exact history, prefix boundaries and the request-only suffix`, async () => {
+	const model = { api, provider, id: "fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, compat: { supportsMidConvoEffort: true } } as Model<any>;
 	const context = normalizeContext({ systemPrompt: "policy", messages: [
 		{ role: "user", content: "A", timestamp: 1 },
 		{ role: "assistant", api: model.api, provider: model.provider, model: model.id, providerThinkingLevel: "low", content: [{ type: "text", text: "Answer A" }], usage, stopReason: "stop", timestamp: 2 },
 		{ role: "user", content: "B", timestamp: 3 },
 	] });
 	let payload: any;
-	await direct.streamSimple(model, context, { apiKey: "sk-fixture", reasoning: "high", onPayload(value) { payload = value; throw new Error("fixture-stop-before-network"); } }).result();
+	const apiKey = provider === "openai" ? "sk-fixture" : `a.${Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "fixture-account" } })).toString("base64url")}.c`;
+	await (adapter as ProviderStreams).streamSimple(model, context, { apiKey, transport: "sse", reasoning: "high", onPayload(value) { payload = value; throw new Error("fixture-stop-before-network"); } }).result();
 	const update = (effort: string) => ({ type: "configuration_update", reasoning: { effort } });
 	expect(payload.input.filter((item: any) => item.type === "configuration_update")).toEqual([update("low"), update("high")]);
 	const snapshot = capturePreparedRequest(model, context, context, payload)!;
@@ -83,6 +84,22 @@ test("effort updates preserve exact history, prefix boundaries and the request-o
 	const extra = structuredClone(payload);
 	extra.input.at(-1).unexpected = true;
 	expect(capturePreparedRequest(model, context, context, extra)).toBeUndefined();
+});
+
+test("legacy Codex capture requires instructions and preserves exact prefix matching", () => {
+	const model = { api: "openai-codex-responses", provider: "openai-codex", id: "fixture", input: ["text"], reasoning: true } as Model<any>;
+	const context = normalizeContext({ systemPrompt: "policy", messages: [
+		{ role: "user", content: "A", timestamp: 1 },
+		{ role: "user", content: "B", timestamp: 2 },
+	] });
+	const modern = serializeInput(model, context);
+	const legacy = { instructions: "policy", input: modern.slice(1) };
+	const snapshot = capturePreparedRequest(model, context, context, legacy)!;
+	expect(snapshot.legacyCodexPrompt).toBe(true);
+	const prefix = normalizeContext({ messages: context.messages.slice(0, 2) });
+	expect(selectCoveredPrefix(model, snapshot, prefix)).toEqual(legacy.input.slice(0, 1));
+	expect(capturePreparedRequest(model, context, context, { input: legacy.input })).toBeUndefined();
+	expect(capturePreparedRequest(model, context, context, { ...legacy, input: legacy.input.slice(1) })).toBeUndefined();
 });
 
 test("missing tool result repairs cannot prove a closed coverage boundary", () => {

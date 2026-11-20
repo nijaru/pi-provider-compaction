@@ -201,7 +201,7 @@ describe("Codex Remote V2 bridge", () => {
 		const provider = {
 			stream(_model: any, _context: any, options: any) {
 				return asyncStream(async () => {
-					prepared = await options.onPayload({ model: codexModel.id, input: [{ type: "message", role: "user", content: [] }] });
+					prepared = await options.onPayload({ model: codexModel.id, max_output_tokens: 128, input: [{ type: "message", role: "user", content: [] }] });
 					const response = await options.fetch("https://chatgpt.com/backend-api/codex/responses", {
 						method: "POST",
 						headers: { authorization: "Bearer oauth", "chatgpt-account-id": "acct" },
@@ -234,6 +234,7 @@ describe("Codex Remote V2 bridge", () => {
 		});
 
 		expect(prepared.input.at(-1)).toEqual({ type: "compaction_trigger" });
+		expect(prepared.max_output_tokens).toBeUndefined();
 		expect(result.output).toEqual([user, checkpoint]);
 		expect(result.usage.totalTokens).toBe(15);
 	});

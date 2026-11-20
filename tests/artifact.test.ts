@@ -14,7 +14,7 @@ const grammar: Tool = { name: "edit", description: "Edit", parameters: Type.Obje
 
 for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-responses", azure], ["openai-codex-responses", codex]] as const) {
 	for (const mid of [false, true]) for (const crossModel of [false, true]) test(`${api}: built artifact captures ${crossModel ? "cross-model ctc_*" : "same-model fc_* promoted to grammar"} history (mid=${mid})`, async () => {
-		const model: Model<any> = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : "azure", id: "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, contextWindow: 100000, maxTokens: 1000, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: mid, supportsAdditionalTools: mid, supportsMidConvoEffort: api === "openai-responses" } };
+		const model: Model<any> = { api, provider: api === "openai-responses" ? "openai" : api === "openai-codex-responses" ? "openai-codex" : "azure", id: "fixture", name: "Fixture", baseUrl: "https://fixture.invalid/v1", input: ["text"], reasoning: true, contextWindow: 100000, maxTokens: 1000, cost: usage.cost, compat: { supportsOpenAIGrammarTools: true, supportsMidConvoSystemMessages: mid, supportsAdditionalTools: mid, supportsMidConvoEffort: api !== "azure-openai-responses" } };
 		const id = crossModel ? "call_A|ctc_A" : "call_A|fc_A";
 		const context = normalizeContext({ systemPrompt: "policy", tools: [grammar], messages: [
 			{ role: "user", content: "Edit A", timestamp: 1 },
@@ -58,7 +58,7 @@ for (const [api, adapter] of [["openai-responses", direct], ["azure-openai-respo
 			expect(payload.input.find((item: any) => item.type === "custom_tool_call").id).toBeUndefined();
 			expect(payload.input.some((item: any) => item.type === "custom_tool_call_output")).toBe(true);
 			expect(JSON.stringify(payload.input)).not.toContain("private thought");
-			if (api === "openai-responses") expect(payload.input.at(-1)).toEqual({ type: "configuration_update", reasoning: { effort: "high" } });
+			if (api !== "azure-openai-responses") expect(payload.input.at(-1)).toEqual({ type: "configuration_update", reasoning: { effort: "high" } });
 			// A captured request reaches auth revalidation before compaction. If the
 			// bundled serializer rejected this host grammar, no snapshot would exist.
 			ctx.modelRegistry.getApiKeyAndHeaders = async () => ({ ok: true, apiKey: "rotated-fixture" });

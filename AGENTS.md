@@ -17,7 +17,7 @@ Experimental cached and provider-native compaction; the minimum runtime remains 
 - V3 is prefix-aligned; v1/v2 are not. Legacy v1 lacks meaningful portable fallback. Do not silently replay or reinterpret legacy state.
 - Native eligibility is runtime-local. Invalidate on lifecycle, history, policy and route changes; hidden state cannot be certified by matching visible summary text. See README for the dynamic-privacy exclusion.
 - Persist no raw keys, tokens, complete headers or request snapshots. Pass resolved headers, including `null` deletions, unchanged to provider transports.
-- Codex uses top-level `instructions`; direct OpenAI/Azure serialize the prompt into `input`. The validator must mirror grammar-tool properties and API-specific strict defaults, and reject drift.
+- Pi 1.6+ puts the Codex system prompt in `input`; older Codex adapters use top-level `instructions`. Validate the captured layout exactly, preserve its prompt for Remote V2, and keep prompt items out of checkpoint replay output. Mirror grammar-tool properties, effort updates, and API-specific strict defaults; reject drift.
 - Preserve complete validated native output windows. Bound both transport output and persisted-state parsing. Do not enable in-stream `context_management` without checkpoint capture.
 
 ## Provider ownership

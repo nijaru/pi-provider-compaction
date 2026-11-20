@@ -14,14 +14,19 @@ export function equal(left: unknown, right: unknown): boolean {
 }
 
 /** Validator only. No serialized item from this function is transmitted. */
-export function serializeInput(model: Model<any>, context: TranscriptContext, declarations = context, configurationUpdateEffort?: string): ResponseItem[] {
+export function serializeInput(model: Model<any>, context: TranscriptContext, declarations = context, configurationUpdateEffort?: string, legacyCodexPrompt = false): ResponseItem[] {
 	const compat = model.compat as Record<string, unknown> | undefined;
 	const flag = (name: string) => compat?.[name] === true;
 	const codex = model.api === "openai-codex-responses";
 	const normalized = resolveTranscript(context, flag("supportsMidConvoSystemMessages"));
 	const tools = resolveTranscript(declarations, flag("supportsMidConvoSystemMessages"));
-	return convertResponsesMessages(model, normalized, model.api === "azure-openai-responses" ? AZURE_TOOL_CALL_PROVIDERS : TOOL_CALL_PROVIDERS, {
-		includeSystemPrompt: !codex,
+	const head = normalized.messages[0];
+	// Older Codex adapters put only the initial prompt text in `instructions`.
+	// Keep the system message's position and tool declarations for conversion.
+	const inputContext = legacyCodexPrompt && head?.role === "system"
+		? { ...normalized, messages: [{ ...head, content: "" }, ...normalized.messages.slice(1)] }
+		: normalized;
+	return convertResponsesMessages(model, inputContext, model.api === "azure-openai-responses" ? AZURE_TOOL_CALL_PROVIDERS : TOOL_CALL_PROVIDERS, {
 		configurationUpdateEffort,
 		grammarToolInputProperties: createGrammarToolInputProperties(getDeclaredTools(tools.messages), flag("supportsOpenAIGrammarTools")),
 		supportsMidConvoSystemMessages: flag("supportsMidConvoSystemMessages"),
@@ -43,6 +48,7 @@ export interface PreparedRequest {
 	portableInput: ResponseItem[];
 	/** The final request-only effort update; historical efforts come from the transcript. */
 	configurationUpdateEffort?: string;
+	legacyCodexPrompt: boolean;
 	replacement?: { index: number; count: number };
 	createdAt: number;
 }
@@ -61,12 +67,18 @@ export function capturePreparedRequest(
 	// below still validates every historical update, its position and its complete shape.
 	const last = payload.input.at(-1);
 	const compat = model.compat as Record<string, unknown> | undefined;
-	const configurationUpdateEffort = model.api === "openai-responses" && compat?.supportsMidConvoEffort === true &&
+	const codex = model.api === "openai-codex-responses";
+	const configurationUpdateEffort = (model.api === "openai-responses" || codex) && compat?.supportsMidConvoEffort === true &&
 		last?.type === "configuration_update" && isObject(last.reasoning) && typeof last.reasoning.effort === "string"
 		? last.reasoning.effort : undefined;
-	const expected = serializeInput(model, context, context, configurationUpdateEffort);
+	let legacyCodexPrompt = false;
+	let expected = serializeInput(model, context, context, configurationUpdateEffort);
+	if (!equal(expected, payload.input) && codex && typeof payload.instructions === "string" && payload.instructions.length > 0) {
+		legacyCodexPrompt = true;
+		expected = serializeInput(model, context, context, configurationUpdateEffort, legacyCodexPrompt);
+	}
 	if (!equal(expected, payload.input)) { reject("prepared input differs from serializer"); return; }
-	return { context: structuredClone(context), canonical: structuredClone(canonical), payload: structuredClone(payload) as PreparedRequest["payload"], portableInput: expected, configurationUpdateEffort, createdAt: Date.now() };
+	return { legacyCodexPrompt, context: structuredClone(context), canonical: structuredClone(canonical), payload: structuredClone(payload) as PreparedRequest["payload"], portableInput: expected, configurationUpdateEffort, createdAt: Date.now() };
 }
 
 function promptCount(input: readonly ResponseItem[]): number {
@@ -76,7 +88,7 @@ function promptCount(input: readonly ResponseItem[]): number {
 }
 
 function serializePrefix(model: Model<any>, snapshot: PreparedRequest, prefix: TranscriptContext): ResponseItem[] {
-	const input = serializeInput(model, prefix, snapshot.context, snapshot.configurationUpdateEffort);
+	const input = serializeInput(model, prefix, snapshot.context, snapshot.configurationUpdateEffort, snapshot.legacyCodexPrompt);
 	// The converter appends the next reply's effort even to a partial transcript.
 	// It is not historical coverage and must remain in the live suffix on replay.
 	return snapshot.configurationUpdateEffort === undefined ? input : input.slice(0, -1);

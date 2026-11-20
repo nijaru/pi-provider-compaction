@@ -457,7 +457,18 @@ async function requestRemoteV2(request: TransportRequest): Promise<TransportResp
 			if (!isObject(payload)) throw new Error("Codex provider exposed a non-object payload");
 			sentInput = structuredClone(request.input);
 			if (request.preparedPayload && request.preparedPayload.model !== payload.model) throw new Error("Native route model changed since capture");
-			return { ...structuredClone(request.preparedPayload ?? payload), stream: true, input: [...sentInput, { type: "compaction_trigger" }] };
+			const prepared = structuredClone(request.preparedPayload ?? payload);
+			// A foreground reply limit below 20K is invalid for compaction_trigger.
+			// Let the endpoint choose its native default without changing the live limit.
+			if (typeof prepared.max_output_tokens === "number" && prepared.max_output_tokens < 20_000) delete prepared.max_output_tokens;
+			// Codex used to carry policy in top-level instructions. With Pi 1.6
+			// the captured prompt items must also accompany the covered history.
+			const prompt: ResponseItem[] = [];
+			if (Array.isArray(prepared.input)) for (const item of prepared.input) {
+				if (!isObject(item) || (item.role !== "developer" && item.role !== "system")) break;
+				prompt.push(item);
+			}
+			return { ...prepared, stream: true, input: [...prompt, ...sentInput, { type: "compaction_trigger" }] };
 		},
 	});
 	try {

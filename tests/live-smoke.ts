@@ -2,7 +2,7 @@
 import { randomBytes } from "node:crypto";
 import { normalizeContext, type AssistantMessage } from "@earendil-works/pi-ai";
 import { ModelRegistry, ModelRuntime } from "@earendil-works/pi-coding-agent";
-import { capturePreparedRequest, selectCoveredPrefix, type PreparedRequest } from "../replay";
+import { capturePreparedRequest, selectCoveredPrefix, summarySlot, type PreparedRequest } from "../replay";
 import { requestProviderCompaction, resolveNativeProtocol } from "../protocol";
 
 const [providerId, modelId] = process.argv.slice(2);
@@ -39,8 +39,10 @@ if (!input) throw new Error("Actual request did not prove prefix coverage");
 const native = await requestProviderCompaction({ provider, model, context, input, preparedPayload: snapshot.payload, protocol, apiKey: auth.apiKey, headers: auth.headers, env: auth.env, signal });
 const followup = normalizeContext({ messages: [prefix.messages[0]!, { role: "user", content: "Portable summary placeholder", timestamp: 4 }, retained, initial, { role: "user", content: "What was the calibration code? Reply with the exact code only.", timestamp: 5 }] });
 const continued = await provider.streamSimple(model, followup, { ...options, onPayload(payload: any) {
-	const prompt = model.api === "openai-codex-responses" ? 0 : 1;
-	return { ...payload, input: [...payload.input.slice(0, prompt), ...native.output, ...payload.input.slice(prompt + 1)] };
+	const replay = capturePreparedRequest(model, followup, followup, payload);
+	const slot = replay && summarySlot(model, replay, normalizeContext({ messages: followup.messages.slice(0, 2) }));
+	if (slot === undefined) throw new Error("Actual continuation did not prove the summary slot");
+	return { ...payload, input: [...payload.input.slice(0, slot), ...native.output, ...payload.input.slice(slot + 1)] };
 } }).result();
 assertSuccess(continued);
 const answer = continued.content.filter((part) => part.type === "text").map((part) => part.text).join("");
